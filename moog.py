@@ -19,12 +19,19 @@ from subprocess import PIPE, Popen
 from textwrap import dedent
 
 # Third party
+import emcee
 import numpy as np
+import numpy.lib.recfunctions as nprfc
+import scipy.ndimage, scipy.optimize, scipy.interpolate
 
 # Module specific
 import utils
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+class MOOGError(BaseException):
+    pass
 
 class instance(object):
     """ A context manager for dealing with MOOG """
@@ -60,7 +67,7 @@ class instance(object):
         if filename is None:
             filename = os.path.join(self.twd, "batch.par")
 
-        logger.info("Executing MOOG input file: {0}".format(filename))
+        logger.info("Executing input file: {0}".format(filename))
 
         class Alarm(Exception):
             pass
@@ -79,7 +86,7 @@ class instance(object):
             alarm(timeout)
         try:
             # Stromlo clusters may need a "\n" prefixed to the input for p.communicate
-            pipe_input = "\n" if -6 in acceptable_moog_return_codes else ""
+            pipe_input = "\n" if -6 in self._acceptable_return_codes else ""
             pipe_input += os.path.basename(filename) + "\n"*100
 
             stdout, stderr = p.communicate(input=pipe_input)
@@ -96,78 +103,67 @@ class instance(object):
             return (-9, '', '')
 
         if p.returncode not in self._acceptable_return_codes:
-            logger.warn("MOOG returned the following message:")
+            logger.warn("MOOG returned the following message (code: {0:d}:".format(p.returncode))
             logger.warn(stdout)
-            logger.warn("MOOG returned the following errors (code: {0:d}):".format(p.returncode))
-            logger.warn(stderr)
+
+            raise MOOGError(stderr)
+            
 
         return (p.returncode, stdout, stderr)
 
 
-    def _format_ew_input(self, measurements, force_loggf=True, comment=None):
-        """Writes equivalent widths to an output file which is compatible for
-        MOOG.
-        
-        Parameters
-        ----
-        measurements : a record array
-            A list where each row contains the following:
-        
-        filename : str
-            Output filename for the measured equivalent widths.
-        
-        transitions : list of float-types, optional
-            A list of transitions to write to file. Default is to write "all"
-            transitions to file.
+    def _cp_to_twd(self, filename):
 
-        force_loggf : bool
-            Should MOOG treat all the oscillator strengths as log(gf) values?
-            If all lines in the list have positive oscillator strengths, using
-            this option will force a fake line in the list with a negative
-            oscillator strength.
-            
-        comment : str, optional
-            A comment to place at the top of the output file.
-        
-        clobber : bool, optional
-            Whether to over-write the `filename` if it already exists.
+        if os.path.dirname(filename) != self.twd:
+            shutil.copy(filename, self.twd)
+            filename = os.path.join(self.twd, os.path.basename(filename))
+
+        elif not os.path.exists(filename):
+            raise IOError("filename {0} does not exist".format(filename))
+
+        return filename
+
+
+    def _format_ew_input(self, measurements, comment=None):
+        """
+        measurments should be recarray
         """
         
-        output_string = comment.rstrip() if comment is not None else ""
-        output_string += "\n"
-        
-        measurements_arr = []
-        for i, measurement in enumerate(measurements):
+        output = comment.rstrip() if comment is not None else ""
+        output += "\n"
 
-            if transitions != "all" and measurement.transition not in transitions: continue
-            if not measurement.is_acceptable or 0 >= measurement.measured_equivalent_width: continue
-            
-            measurements_arr.append([measurement.rest_wavelength,
-                                     measurement.transition,
-                                     measurement.excitation_potential,
-                                     measurement.oscillator_strength,
-                                     measurement.measured_equivalent_width])
+        line = "{0:10.3f} {1:9.3f} {2:8.2f} {3:6.2f}                             {4:5.1f}\n"
 
-
-        if force_loggf and np.all(measurements["loggf"] > 0):
-            logger.warn("Adding fake line at 900 nm with a negative oscillator strength.")
-            
-            measurements = np.append(measurements, np.array([faux_line], dtype=measurements.dtype))
-            measurements_arr = np.insert(measurements_arr, 0, [9000., 89., 0.0, -9.999, 0.0], axis=0)
-        
         # Sort all the lines first transition, then by wavelength
         measurements = sorted(measurements, key=itemgetter("species", "wavelength"))
 
-        for measurement in measurements:
-            output_string += "{0:10.3f} {1:9.3f} {2:8.2f} {3:6.2f}                             {4:5.1f}\n".format(
-                *[measurement[col] for col in ["wavelength", "species", "excitation_potential", "loggf", "equivalent_width"]])
+        include_uncertainties = "u_equivalent_width" in measurements.dtype.names
+        for i, measurement in enumerate(measurements):
 
-        return output_string
+            # TODO: Ignoring van Der Waal damping coefficients for the moment << implement if they exist!
+            output += line.format(*[measurement[col] for col in ["wavelength", "species",
+                "excitation_potential", "loggf", "equivalent_width"]])
+
+            # If we have an uncertainty in equivalent width, we will propagate this to an
+            # uncertainty in abundance, so we will have two lines for each measurement
+            if include_uncertainties:
+                additional_line_data = [measurement[col] for col in ["wavelength", "species",
+                    "excitation_potential", "loggf"]]
+                additional_line_data.append(measurement["equivalent_width"] \
+                    + measurement["u_equivalent_width"])
+                output += line.format(*additional_line_data)
+
+
+        if force_loggf and np.all(measurements["loggf"] > 0):
+            warnings.warn("The atomic line list contains no lines with positive oscillator "
+                "strengths. MOOG will not treat these as logarithmic oscillator strengths!")
+
+        return output
         
 
 
     def _format_abfind_input(self, line_list_filename, model_atmosphere_filename, standard_out,
-        summary_out, terminal="x11", atmosphere=1, molecules=0, truedamp=1, lines=1,
+        summary_out, terminal="x11", atmosphere=1, molecules=1, truedamp=1, lines=1,
         freeform=0, flux_int=0, damping=0, units=0):
 
         output = """
@@ -230,20 +226,146 @@ class instance(object):
             names=columns, formats=["f8"] * len(columns))
 
 
-    def abfind(self, measurements, model_atmosphere, **kwargs):
+    def _format_synth_input(self, line_list_filename, model_atmosphere_filename, standard_out,
+        summary_out, abundances=None, terminal="x11", atmosphere=1, molecules=1, truedamp=1,
+        lines=1, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, **kwargs):
+
+        # Set wavelength ranges if they don't exist
+        if not kwargs.has_key("wl_min") or not kwargs.has_key("wl_max"):
+            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
+            kwargs.setdefault("wl_min", min(wavelengths) - wl_cont)
+            kwargs.setdefault("wl_max", max(wavelengths) + wl_cont)
+
+        if abundances is not None:
+
+            if isinstance(abundances.values()[0], (tuple, list, np.ndarray)):
+                if len(set(map(len, abundances.values()))) > 1:
+                    raise ValueError("same number of abundances must be provided for all species")
+
+                num_requested_spectra = len(abundances.values()[0])
+                if num_requested_spectra > 5:
+                    raise ValueError("MOOG will fall over if you request more than 5 spectra from synth driver")
+
+            else:
+                num_requested_spectra = 1
+
+            abundance_str = "abundances    {0:.0f} {1:.0f}\n".format(len(abundances), num_requested_spectra)
+            for species, species_abundances in abundances.iteritems():
+                abundance_str += "          {0:.0f} {1}\n".format(species, \
+                    " ".join(["{0:.3f}".format(s) for s in np.array(species_abundances).flatten()]))
+
+        else:
+            abundance_str = ""
+
+        kwargs.update(locals())
+
+        output = """
+        synth
+        terminal '{terminal}'
+        standard_out '{standard_out}'
+        summary_out '{summary_out}'
+        model_in '{model_atmosphere_filename}'
+        lines_in '{line_list_filename}'
+        atmosphere {atmosphere}
+        molecules {molecules}
+        lines {lines}
+        freeform {freeform}
+        flux/int {flux_int}
+        damping {damping}
+        plot 0
+        synlimits
+          {wl_min:.2f} {wl_max:.2f} {wl_step:.4f} {wl_cont:.2f}
+        plotpars 1
+          {wl_min:.2f} {wl_max:.2f} 0 1
+          0 0 0 1
+          g 0 0 0 0 0 
+        obspectrum 0
+        {abundance_str}
+        """.format(**kwargs)
+        
+        return dedent(output).strip()
+
+
+    def _parse_synth_standard_output(self, filename):
+
+        with open(filename, "r") as fp:
+            output = fp.readlines()
+
+        depths = []
+        for i, line in enumerate(output):
+            if line.startswith("SYNTHETIC SPECTRUM PARAMETERS"):
+
+                next_line = output[i + 1].split()
+                wl_min, wl_max = map(float, [next_line[2], next_line[5]])
+                wl_step = float(output[i + 2].split()[-1])
+                
+                dispersion = np.arange(wl_min, wl_max + wl_step, wl_step)
+    
+            elif ': depths=' in line:
+                flux_data = line[19:].rstrip()
+                depths.extend(map(float, [flux_data[j:j+6] for j in xrange(0, len(flux_data), 6)]))
+
+        depths = np.array(depths)
+
+        # Multiple spectra?
+        num_pixels = len(dispersion)
+        num_spectra = len(depths)/num_pixels
+
+        fluxes = []
+        for i in xrange(num_spectra):
+            fluxes.append(1. - depths[i*num_pixels:(i+1)*num_pixels])
+
+        return (dispersion, fluxes)
+
+
+    def synth(self, line_list_filename, atmosphere_filename, parallel=False, **kwargs):
+
+        # Prepare a synth file
+        line_list_filename = self._cp_to_twd(line_list_filename)
+        atmosphere_filename = self._cp_to_twd(atmosphere_filename)
+        
+        # Prepare the input and output filenames
+        if not parallel:
+            input_filename, standard_out, summary_out = [os.path.join(self.twd, filename) \
+                for filename in ("batch.par", "abfind.std", "abfind.sum")]
+        
+        else:
+            input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
+            while os.path.exists(input_filename):
+                input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
+
+            standard_out = input_filename[:-3] + ".out"
+            summary_out = os.path.join(self.twd, "abfind.sum")
+
+        # Write the synth file
+        with open(input_filename, "w") as fp:
+            fp.write(self._format_synth_input(line_list_filename, atmosphere_filename, standard_out,
+                summary_out, **kwargs))
+
+        # Execute it, retrieve spectra
+        result, stdout, stderr = self.execute(input_filename)
+
+        output = self._parse_synth_standard_output(standard_out)
+
+        if not parallel:
+            # Remove in/out files
+            map(os.remove, [input_filename, standard_out, summary_out])
+
+        return output
+
+
+    def abfind(self, line_list_filename, model_atmosphere, **kwargs):
         """ Call `abfind` in MOOG """
 
-        if os.path.dirname(model_atmosphere) != self.twd:
-            shutil.copy(model_atmosphere, self.twd)
-            model_atmosphere = os.path.join(self.twd, os.path.basename(model_atmosphere))
+        model_atmosphere = self._cp_to_twd(model_atmosphere)
+        line_list_filename = self._cp_to_twd(line_list_filename)
 
-        elif not os.path.exists(model_atmosphere):
-            raise IOError("model atmosphere filename {0} does not exist".format(model_atmosphere))
-
+        """
         # Write the equivalent widths to file
-        line_list_filename = os.path.join(self.twd, "ews")
+        os.path.join(self.twd, "ews")
         with open(line_list_filename, "w") as fp:
             fp.write(self._format_ew_input(measurements, **kwargs))
+        """
 
         # Prepare the input and output filenames
         input_filename, standard_out, summary_out = [os.path.join(self.twd, filename) \
@@ -257,13 +379,26 @@ class instance(object):
         # Execute MOOG
         result, stdout, stderr = self.execute()
 
-        # Parse the output
-        return self._parse_abfind_summary_output(summary_out)
+        abundances = self._parse_abfind_summary_output(summary_out)
+
+        # Did we propagate uncertainties in equivalent width to MOOG?
+        # TODO: These are one-sided 68% CIs as "uncertainties". We should really be propagating
+        # the whole distribution of measured equivalent widths and rest wavelengths!
+        if "u_equivalent_width" in measurements.dtype.names:
+
+            # Create a new table with the uncertainties included
+            abundances = nprcf.append_fields(abundances[::2], "u_abundance",
+                abundances[1::2] - abundances[::2], usemask=False)
+
+        return abundances
 
 
-    def __exit__(self, type, value, traceback):
+    def __exit__(self, exit_type, value, traceback):
         # Remove the temporary working directory and any files in it
-        shutil.rmtree(self.twd)
+        if exit_type not in (IOError, MOOGError):
+            shutil.rmtree(self.twd)
+        else:
+            logger.info("Temporary directory {0} has been kept to allow debugging".format(self.twd))
         return False
 
 
