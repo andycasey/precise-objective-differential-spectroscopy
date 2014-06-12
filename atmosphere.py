@@ -1195,12 +1195,12 @@ def get_parsers():
     """ Returns an OrderedDict of the available parsers in order of preference """
 
     # Set up parsers   
-    preferred_atmospheres = "Castelli & Kurucz (2003)"
+    preferred_atmospheres = "MARCS (2011)"
     possible_parsers = {
-        "MARCS (2011)": ("atmospheres/marcs-2011/", MARCSParser),
-        "Castelli & Kurucz (2003)": ("atmospheres/castelli-kurucz-2004/", CastelliKuruczParser),
-        u"ATMO ⟨3D⟩": ("atmospheres/atmo-3d/", AtmoATLASParser),
-        u"Stagger-grid ⟨3D⟩": ("atmospheres/stagger-grid-3d/", StaggerGridATLASParser),
+        "MARCS (2011)": ("atmospheres/marcs/", MARCSParser),
+        "Castelli & Kurucz (2003)": ("atmospheres/castelli-kurucz/", CastelliKuruczParser),
+        u"ATMO ⟨3D⟩": ("atmospheres/atmo/", AtmoATLASParser),
+        u"Stagger-grid ⟨3D⟩": ("atmospheres/stagger/", StaggerGridATLASParser),
     }
 
     parsers = OrderedDict({preferred_atmospheres: None})
