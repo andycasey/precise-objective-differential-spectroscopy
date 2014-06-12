@@ -1,0 +1,3 @@
+[submodule "specutils"]
+	path = specutils
+	url = git@github.com:astropy/specutils.git
