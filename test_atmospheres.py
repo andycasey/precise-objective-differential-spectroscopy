@@ -46,7 +46,7 @@ for i, (ax, y) in enumerate(zip(axes.flatten(), interpolated_properties)):
     relative_difference = 100 * (solar_thermal_structure[y] - interpolated_thermal_structure[y])/solar_thermal_structure[y]
     finite = np.isfinite(relative_difference)
     if not np.all(relative_difference[finite] < 5.):
-        logging.warn("Relative difference in {0} exceeds 5% ({1} > 5)!".format(y, int(np.max(relative_difference))))
+        logging.warn("Relative difference in {0} exceeds 5% ({1} > 5)!".format(y, int(np.max(relative_difference[finite]))))
 
     ax.plot(solar_thermal_structure[x], relative_difference, 'k')
 
