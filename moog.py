@@ -1,6 +1,6 @@
 # coding: utf-8
 
-""" Interface to MOOG(SILENT) """
+""" A Pythonic Interface to MOOG(SILENT) """
 
 __author__ = "Andy Casey <andy@astrowizici.st>"
 
@@ -26,6 +26,7 @@ import scipy.ndimage, scipy.optimize, scipy.interpolate
 
 # Module specific
 import utils
+from specutils import Spectrum1D
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -162,9 +163,9 @@ class instance(object):
         
 
 
-    def _format_abfind_input(self, line_list_filename, model_atmosphere_filename, standard_out,
-        summary_out, terminal="x11", atmosphere=1, molecules=1, truedamp=1, lines=1,
-        freeform=0, flux_int=0, damping=0, units=0):
+    def _format_abfind_input(self, model_atmosphere_filename, line_list_filename, standard_out,
+        summary_out, terminal="x11", atmosphere=1, molecules=1, lines=1,
+        freeform=0, flux_int=0, damping=1, units=0):
 
         output = """
         abfind
@@ -178,7 +179,7 @@ class instance(object):
         lines {lines}
         freeform {freeform}
         flux/int {flux_int}
-        damping {damping}
+        trudamp {damping}
         plot 0
         """.format(**locals())
         
@@ -226,7 +227,7 @@ class instance(object):
             names=columns, formats=["f8"] * len(columns))
 
 
-    def _format_synth_input(self, line_list_filename, model_atmosphere_filename, standard_out,
+    def _format_synth_input(self, model_atmosphere_filename, line_list_filename, standard_out,
         summary_out, abundances=None, terminal="x11", atmosphere=1, molecules=1, truedamp=1,
         lines=1, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, **kwargs):
 
@@ -286,7 +287,7 @@ class instance(object):
         return dedent(output).strip()
 
 
-    def _parse_synth_standard_output(self, filename):
+    def _parse_synth_standard_output(self, filename, num_spectra):
 
         with open(filename, "r") as fp:
             output = fp.readlines()
@@ -303,22 +304,31 @@ class instance(object):
     
             elif ': depths=' in line:
                 flux_data = line[19:].rstrip()
-                depths.extend(map(float, [flux_data[j:j+6] for j in xrange(0, len(flux_data), 6)]))
+                depths.extend(map(float, [flux_data[j:j+6].replace("******", "0") for j in xrange(0, len(flux_data), 6)]))
+
+        if len(depths) == 0:
+            raise MOOGError("no flux depths found in {0}".format(filename))
 
         depths = np.array(depths)
-
-        # Multiple spectra?
-        num_pixels = len(dispersion)
-        num_spectra = len(depths)/num_pixels
+        num_pixels = len(depths)/num_spectra
+        
+        if len(dispersion) > num_pixels:
+            logger.warn("Dispersion points ({0}) did not equal flux points ({1}) for spectrum"
+                " returned by MOOG".format(len(dispersion), num_pixels))
+            dispersion = dispersion[:num_pixels]
 
         fluxes = []
         for i in xrange(num_spectra):
             fluxes.append(1. - depths[i*num_pixels:(i+1)*num_pixels])
 
+        # Convert to spectra?
+        # TODO
+
+        # CHECK THAT THE LENGTHS ARE THE SAME
         return (dispersion, fluxes)
 
 
-    def synth(self, line_list_filename, atmosphere_filename, parallel=False, **kwargs):
+    def synth(self, atmosphere_filename, line_list_filename, parallel=False, **kwargs):
 
         # Prepare a synth file
         line_list_filename = self._cp_to_twd(line_list_filename)
@@ -339,22 +349,23 @@ class instance(object):
 
         # Write the synth file
         with open(input_filename, "w") as fp:
-            fp.write(self._format_synth_input(line_list_filename, atmosphere_filename, standard_out,
+            fp.write(self._format_synth_input(atmosphere_filename, line_list_filename, standard_out,
                 summary_out, **kwargs))
 
         # Execute it, retrieve spectra
         result, stdout, stderr = self.execute(input_filename)
 
-        output = self._parse_synth_standard_output(standard_out)
+        num_spectra = len(kwargs["abundances"].values()[0]) if "abundances" in kwargs else 1
+        spectrum = self._parse_synth_standard_output(standard_out, num_spectra)
 
         if not parallel:
             # Remove in/out files
             map(os.remove, [input_filename, standard_out, summary_out])
 
-        return output
+        return spectrum
 
 
-    def abfind(self, line_list_filename, model_atmosphere, **kwargs):
+    def abfind(self, model_atmosphere, line_list_filename, **kwargs):
         """ Call `abfind` in MOOG """
 
         model_atmosphere = self._cp_to_twd(model_atmosphere)
