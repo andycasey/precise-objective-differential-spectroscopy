@@ -19,14 +19,10 @@ from subprocess import PIPE, Popen
 from textwrap import dedent
 
 # Third party
-import emcee
 import numpy as np
-import numpy.lib.recfunctions as nprfc
-import scipy.ndimage, scipy.optimize, scipy.interpolate
 
 # Module specific
 import utils
-from specutils import Spectrum1D
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -40,30 +36,40 @@ class instance(object):
     _executable = "MOOGSILENT"
     _acceptable_return_codes = (0, )
 
-    def __init__(self, twd_base_dir="/tmp/", chars=10):
+    def __init__(self, twd_base_dir="/tmp/", prefix="moog", chars=10):
         """ Initialisation class allows the user to specify a base temporary
         working directory """
 
+        if prefix is None:
+            prefix = ""
+
         self.chars = chars
+        self.prefix = prefix
         self.twd_base_dir = twd_base_dir
         if not os.path.exists(self.twd_base_dir):
             os.mkdir(self.twd_base_dir)
 
     def __enter__(self):
         # Create a temporary working directory
-        self.twd = os.path.join(self.twd_base_dir, "".join([choice(ascii_letters) for _ in xrange(self.chars)]))
+        self.twd = os.path.join(self.twd_base_dir, self.prefix \
+            + "".join([choice(ascii_letters) for _ in xrange(self.chars)]))
         while os.path.exists(self.twd):
-            self.twd = os.path.join(self.twd_base_dir, "".join([choice(ascii_letters) for _ in xrange(self.chars)]))
+            self.twd = os.path.join(self.twd_base_dir, self.prefix \
+                + "".join([choice(ascii_letters) for _ in xrange(self.chars)]))
         
         os.mkdir(self.twd)
         if len(self.twd) > 40:
-            warnings.warn("MOOG has trouble dealing with absolute paths greater than 40 characters long. Consider"
-                " a shorter absolute path for your temporary working directory.")
+            warnings.warn("MOOG has trouble dealing with absolute paths greater than 40 "
+                "characters long. Consider a shorter absolute path for your temporary wo"
+                "rking directory.")
+
         return self
 
 
     def execute(self, filename=None, timeout=30, shell=False, env=None):
-        """ Execute a MOOG input file with a timeout after which it will be forcibly killed. """
+        """
+        Execute a MOOG input file with a timeout after which it will be forcibly killed.
+        """
 
         if filename is None:
             filename = os.path.join(self.twd, "batch.par")
@@ -79,22 +85,23 @@ class instance(object):
         if env is None and len(os.path.dirname(self._executable)) > 0:
             env = {"PATH": os.path.dirname(self._executable)}
 
-        p = Popen([os.path.basename(self._executable)], shell=shell, bufsize=2056, cwd=self.twd, stdin=PIPE, stdout=PIPE, 
-            stderr=PIPE, env=env, close_fds=True)
+        p = Popen([os.path.basename(self._executable)], shell=shell, bufsize=2056,
+            cwd=self.twd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env, close_fds=True)
 
         if timeout != -1:
             signal(SIGALRM, alarm_handler)
             alarm(timeout)
+
         try:
-            # Stromlo clusters may need a "\n" prefixed to the input for p.communicate
+            # NB: Stromlo clusters may need a "\n" prefixed to the input for p.communicate
             pipe_input = "\n" if -6 in self._acceptable_return_codes else ""
             pipe_input += os.path.basename(filename) + "\n"*100
 
             stdout, stderr = p.communicate(input=pipe_input)
             if timeout != -1:
                 alarm(0)
-        except Alarm:
 
+        except Alarm:
             # process might have died before getting to this line
             # so wrap to avoid OSError: no such process
             try:
@@ -104,12 +111,11 @@ class instance(object):
             return (-9, '', '')
 
         if p.returncode not in self._acceptable_return_codes:
-            logger.warn("MOOG returned the following message (code: {0:d}:".format(p.returncode))
+            logger.warn("MOOG returned the following message (code: {0:d}:".format(
+                p.returncode))
             logger.warn(stdout)
 
             raise MOOGError(stderr)
-            
-
         return (p.returncode, stdout, stderr)
 
 
@@ -153,7 +159,6 @@ class instance(object):
                 additional_line_data.append(measurement["equivalent_width"] \
                     + measurement["u_equivalent_width"])
                 output += line.format(*additional_line_data)
-
 
         if force_loggf and np.all(measurements["loggf"] > 0):
             warnings.warn("The atomic line list contains no lines with positive oscillator "
@@ -229,13 +234,19 @@ class instance(object):
 
     def _format_synth_input(self, model_atmosphere_filename, line_list_filename, standard_out,
         summary_out, abundances=None, terminal="x11", atmosphere=1, molecules=1, truedamp=1,
-        lines=1, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, **kwargs):
+        lines=1, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, wl_edge=2,
+        **kwargs):
 
         # Set wavelength ranges if they don't exist
         if not kwargs.has_key("wl_min") or not kwargs.has_key("wl_max"):
-            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
-            kwargs.setdefault("wl_min", min(wavelengths) - wl_cont)
-            kwargs.setdefault("wl_max", max(wavelengths) + wl_cont)
+            try:
+                wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
+            except (ValueError, TypeError) as e:
+                # The first row is a comment. Skip it.
+                wavelengths = np.loadtxt(line_list_filename, usecols=(0, ), skiprows=1)
+
+            kwargs.setdefault("wl_min", min(wavelengths) - wl_edge)
+            kwargs.setdefault("wl_max", max(wavelengths) + wl_edge)
 
         if abundances is not None:
 
