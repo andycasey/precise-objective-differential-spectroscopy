@@ -19,15 +19,9 @@ logger.setLevel(logging.DEBUG)
 
 class ApproximateModelSpectrum(object):
 
-    # Here we define MOOG keyword arguments because all classes should be consistent
-    moog_kwargs = {
-        "wl_cont": 2.,
-        "wl_edge": 2.,
-        "parallel": True
-    }
-    
-    def __init__(self, model_atmosphere_filename, line_list_filename, elements,
-        convolve=False, v_rad=False, continuum=False, continuum_order=-1):
+    def __init__(self, line_list_filename, model_atmosphere_filename, elements,
+        convolve=False, v_rad=False, continuum=False, continuum_order=-1, outliers=False,
+        moog_instance=None):
         """
 
         Convolve and v_rad can be True/False or actual values. If True, it's a
@@ -49,10 +43,16 @@ class ApproximateModelSpectrum(object):
         self.parameters = []
         self.fixed_parameters = {}
 
+        self.moog_kwargs = {
+            "wl_cont": 2.,
+            "wl_edge": 2.,
+            "parallel": True
+        }
+    
         self.elements = elements
-        self.continuum_order = continuum_order
         self.line_list_filename = line_list_filename
         self.model_atmosphere_filename = model_atmosphere_filename
+        self.moog_instance = None
 
         # Determine the parameters
         if v_rad is True:
@@ -67,7 +67,9 @@ class ApproximateModelSpectrum(object):
             # Convolution is fixed.
             self.fixed_parameters["convolve"] = convolve
 
+        self.continuum_order = -1
         if continuum is True:
+            self.continuum_order = continuum_order
             if continuum_order >= 0:
                 self.parameters.extend(["c_{0}".format(i) for i in range(continuum_order + 1)])
                 
@@ -77,6 +79,9 @@ class ApproximateModelSpectrum(object):
         elif hasattr(continuum, "__call__"):
             self.fixed_parameters["continuum"] = continuum
 
+        if outliers:
+            self.parameters.extend(["Pb", "Vb", "Yb"])
+
         self.parameters.extend(map(lambda x: "Z_{0}".format(x), self.elements))
 
         # Determine wl_min and wl_max
@@ -84,11 +89,12 @@ class ApproximateModelSpectrum(object):
             wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
         except (ValueError, TypeError) as e:
             # First row is probably a comment
-            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
+            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ), skiprows=1)
 
         self.moog_kwargs.update({
             "wl_min": np.min(wavelengths) - self.moog_kwargs["wl_edge"],
-            "wl_max": np.max(wavelengths) + self.moog_kwargs["wl_edge"]
+            "wl_max": np.max(wavelengths) + self.moog_kwargs["wl_edge"],
+            "wl_step": 0.001
         })
 
         # Ensure we haven't done anything silly
@@ -107,14 +113,18 @@ class ApproximateModelSpectrum(object):
         # Do abundances
         abundances = {}
         for element in self.elements:
-            neutral_species = np.floor(utils.element_to_species(element))
-            abundances[neutral_species] = [theta_dict["Z_"+element]]
-            abundances[neutral_species + 0.1] = [theta_dict["Z_"+element]]
+            species = np.floor(utils.element_to_species(element))
+            abundances[species] = [theta_dict["Z_"+element]]
 
         # Synthesise flux
-        with moog.instance() as moogsilent:
-            model_dispersion, model_fluxes = moogsilent.synth(self.model_atmosphere_filename,
+        if self.moog_instance is not None:
+            model_dispersion, model_fluxes = self.moog_instance.synth(self.model_atmosphere_filename,
                 self.line_list_filename, abundances=abundances, **self.moog_kwargs)
+
+        else:
+            with moog.instance() as moogsilent:
+                model_dispersion, model_fluxes = moogsilent.synth(self.model_atmosphere_filename,
+                    self.line_list_filename, abundances=abundances, **self.moog_kwargs)
 
         # Select only the first spectrum
         model_flux = model_fluxes[0]
@@ -143,7 +153,18 @@ class ApproximateModelSpectrum(object):
         return (model_dispersion, model_flux)
 
 
-    def optimise(self, data, p0=None, p0_abundance_range=[-2, -1, 0, 1, 2], xtol=0.01,
+    def _mask(self, observed_dispersion, rest_frame_regions, z, mask_value=np.nan):
+
+        mask = np.ones(len(observed_dispersion))
+        for region in rest_frame_regions:
+            shifted_region = region * (1. + z)
+            indices = observed_dispersion.searchsorted(shifted_region)
+            mask.__setslice__(indices[0], indices[1] + 1, mask_value)
+
+        return mask
+
+
+    def optimise(self, data, p0=None, p0_abundance_range=[-2.5, 2.5], masks=None, xtol=0.01,
         maxiter=10, full_output=False, op_kwargs=None):
 
         dispersion, flux, variance = data.dispersion, data.flux, data.variance
@@ -153,36 +174,44 @@ class ApproximateModelSpectrum(object):
             [self.moog_kwargs["wl_min"], self.moog_kwargs["wl_max"]])
         dispersion = data.dispersion.__getslice__(*indices)
         flux = data.flux.__getslice__(*indices)
-        ivar = 1.0/data.variance.__getslice__(*indices)
+        variance = data.variance.__getslice__(*indices)
+        ivar = 1.0/variance
 
         finite = np.isfinite(flux)
 
         # Approximate the wavelength sampling for MOOG
-        self.moog_kwargs["wl_step"] = np.median(np.diff(dispersion))
+        #self.moog_kwargs["wl_step"] = np.median(np.diff(dispersion))
+
+        if masks is None:
+            masks = []
 
         if p0 is None: p0 = {}
         p0 = [p0.get(parameter, 0) for parameter in self.parameters]
         p0_abundance_range = np.array(p0_abundance_range)
 
         if op_kwargs is None:
-            op_kwargs = {"disp": False}
+            op_kwargs = {"disp": False, "full_output": True}
         else:
             if "xtol" in op_kwargs:
                 del op_kwargs["xtol"]
+            op_kwargs["full_output"] = True
 
         # Let's synthesize 5 spectra at once then use them for interpolation
         abundances = {}
         for element in self.elements:
-            neutral_species = np.floor(utils.element_to_species(element))
-            abundances[neutral_species] = p0_abundance_range
-            abundances[neutral_species + 0.1] = p0_abundance_range
-
+            species = np.floor(utils.element_to_species(element))
+            abundances[species] = p0_abundance_range
+            
         niter, warnflag, converged, previous_abundances = 0, 0, False, None
         while not converged:
             
-            with moog.instance() as moogsilent:
-                model_dispersion, model_fluxes = moogsilent.synth(self.model_atmosphere_filename,
+            if self.moog_instance is not None:
+                model_dispersion, model_fluxes = self.moog_instance.synth(self.model_atmosphere_filename,
                     self.line_list_filename, abundances=abundances, **self.moog_kwargs)
+            else:
+                with moog.instance() as moogsilent:
+                    model_dispersion, model_fluxes = moogsilent.synth(self.model_atmosphere_filename,
+                        self.line_list_filename, abundances=abundances, **self.moog_kwargs)
 
             # Create an interpolator to interpolate between these spectra
             if len(self.elements) == 1:
@@ -190,10 +219,24 @@ class ApproximateModelSpectrum(object):
                     bounds_error=False)
 
             else:
-                raise NotImplementedError("use LinearNDInterpolator")
+                raise NotImplementedError("use LinearNDInterpolator?")
 
-            # Define a chi-sq function to fit to the data
-            def chi_sq(theta):
+            def ln_prior(theta):
+
+                theta_dict = dict(zip(self.parameters, theta))
+
+                Pb = theta_dict.get("Pb", 0)
+                if Pb > 1 or 0 > Pb:
+                    return -np.inf
+
+                Vb = theta_dict.get("Vb", 1)
+                if 0 >= Vb:
+                    return -np.inf
+
+                return 0
+
+            # Define our scalar function to fit the model to the data
+            def ln_likelihood(theta):
 
                 theta_dict = dict(zip(self.parameters, theta))
                 get_parameter = lambda p, d: theta_dict.get(p, self.fixed_parameters.get(p, d)) 
@@ -224,16 +267,33 @@ class ApproximateModelSpectrum(object):
                         for i in range(self.continuum_order + 1)], dispersion)
                     interpolated_flux *= continuum
 
-                # Calculate the chi-sq
-                chi_sq = (flux - interpolated_flux)**2 * ivar
-                finite = np.isfinite(chi_sq)
-                if not np.any(finite):
-                    return np.inf
+                # Any masks to apply?
+                interpolated_flux *= self._mask(dispersion, masks, z)
 
-                return np.sum(chi_sq[finite])
+                photosphere_likelihood = -0.5 * ((flux - interpolated_flux)**2 * ivar - np.log(ivar))
+
+                if "Pb" in theta_dict:
+                    outlier_ivar = 1.0/(variance + theta_dict["Vb"])
+                    outlier_likelihood = -0.5 * ((flux - theta_dict["Yb"])**2 * outlier_ivar - np.log(outlier_ivar))
+
+                    Pb = theta_dict["Pb"]
+                    likelihood = np.logaddexp(np.log(1. - Pb) + photosphere_likelihood, np.log(Pb) + outlier_likelihood)
+
+                else:
+                    likelihood = photosphere_likelihood
+
+                finite = np.isfinite(likelihood)
+                if not np.any(finite):
+                    return -np.inf
+
+                return np.sum(likelihood[finite])
+
+            def ln_prob(theta):
+                return ln_prior(theta) + ln_likelihood(theta)
 
             # Optimise!
-            opt_p0 = op.fmin_powell(chi_sq, p0, xtol=xtol, **op_kwargs)
+            opt_p0, f_opt_p0, direc, op_iter, op_funcalls, op_warnflag = op.fmin_powell(
+                lambda theta: -ln_prob(theta), p0, xtol=xtol, **op_kwargs)
             if len(self.parameters) == 1:
                 opt_p0 = [opt_p0]
             opt_p0_dict = dict(zip(self.parameters, opt_p0))
@@ -250,16 +310,15 @@ class ApproximateModelSpectrum(object):
 
             # Half the p0_range and check for convergence
             for element in self.elements:
-                neutral_species = np.floor(utils.element_to_species(element))
+                species = np.floor(utils.element_to_species(element))
 
                 opt_value = opt_p0_dict["Z_"+element]
 
-                n_spectra = len(abundances[neutral_species])
-                half_range = np.ptp(abundances[neutral_species])/2.
+                n_spectra = len(abundances[species])
+                half_range = np.ptp(abundances[species])/2.
                 new_abundance_range = np.linspace(opt_value - half_range/2., opt_value + half_range/2., n_spectra)
-                abundances[neutral_species] = new_abundance_range
-                abundances[neutral_species + 0.1] = new_abundance_range
-
+                abundances[species] = new_abundance_range
+                
             p0 = opt_p0
 
             niter += 1
@@ -269,147 +328,15 @@ class ApproximateModelSpectrum(object):
                 break
 
         if full_output:
-            return opt_p0, warnflag
+            return opt_p0, f_opt_p0, warnflag
 
         return opt_p0
 
 
 
+aa = ApproximateModelSpectrum("lin58092lab", "marcs-sun.model", "Fe", v_rad=0,
+    convolve=True, continuum=False, outliers=True, continuum_order=1)
 
-
-
-
-class ModelSpectrum(object):
-
-    moog_kwargs = {
-        "wl_cont": 2.,
-        "wl_edge": 2.
-    }
-
-    def __init__(self, model_atmosphere_filename, line_list_filename, elements,
-        convolve=True, v_rad=True, outliers=False, continuum_order=-1):
-
-        if isinstance(elements, (str, unicode)):
-            elements = [elements]
-
-        # Check the elements
-        assert len(elements) > 0
-        assert map(utils.element_to_species, elements)
-
-        self.elements = elements
-        self.line_list_filename = line_list_filename
-        self.model_atmosphere_filename = model_atmosphere_filename
-
-        # Determine the parameters
-        self.parameters = []
-        if v_rad:
-            self.parameters.append("v_rad")
-        if convolve:
-            self.parameters.append("convolve")
-        if outliers:
-            self.parameters.extend(["Pb", "Vb", "Yb"])
-        if continuum_order >= 0:
-            self.parameters.extend(["c{0}".format(i) for i in range(continuum_order + 1)])
-
-        self.parameters.extend(map(lambda x: "Z_{0}".format(x), self.elements))
-
-        # Determine wl_min and wl_max
-        try:
-            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
-        except (ValueError, TypeError) as e:
-            # First row is probably a comment
-            wavelengths = np.loadtxt(line_list_filename, usecols=(0, ))
-
-        self.moog_kwargs.update({
-            "wl_min": np.min(wavelengths) - self.moog_kwargs["wl_edge"],
-            "wl_max": np.max(wavelengths) + self.moog_kwargs["wl_edge"]
-        })
-
-
-    def optimise(self, data, p0=None):
-
-        dispersion, flux, variance = data.dispersion, data.flux, data.variance
-
-        # Slice the data, clean up non-finite fluxes, etc
-        indices = np.searchsorted(data.dispersion,
-            [self.moog_kwargs["wl_min"], self.moog_kwargs["wl_max"]])
-        dispersion = data.dispersion.__getslice__(*indices)
-        flux = data.flux.__getslice__(*indices)
-        ivar = 1.0/data.variance.__getslice__(*indices)
-
-        finite = np.isfinite(flux)
-
-        # Approximate the wavelength sampling for MOOG
-        self.moog_kwargs["wl_step"] = np.median(np.diff(dispersion))
-
-        if p0 is None: p0 = {}
-        opt_p0 = [p0.get(parameter, 0) for parameter in self.parameters]
-
-        with moog.instance(prefix="moog", debug=True) as moogsilent:
-
-            def chi_sq(theta):
-                
-                theta_dict = dict(zip(self.parameters, theta))
-
-                model_dispersion, model_flux = self._synthesise_(theta, moog_instance=moogsilent)
-
-                # Take only the first spectrum
-                model_flux = model_flux[0]
-                convolve = abs(theta_dict.get("convolve", 0))
-                if convolve > 0:
-                    ndimage.gaussian_filter(model_flux, convolve, output=model_flux)
-                
-                # Due to rounding errors, the length of model_dispersion won't always
-                # match dispersion, so we must interpolate
-                model_flux = np.interp(dispersion, model_dispersion * (1. + theta_dict.get("v_rad", 0)/299792458e-3),
-                model_flux, left=np.nan, right=np.nan)
-
-                # Create a mask of which regions to use?
-
-                chi_sq = (flux - model_flux)**2 * ivar
-                finite = np.isfinite(chi_sq)
-                if not np.any(finite):
-                    return np.inf
-
-                result = np.sum(chi_sq[finite])
-                print(theta, result)
-
-                return result
-
-            final_p0 = op.fmin_powell(chi_sq, opt_p0, xtol=0.01)
-
-        return final_p0
-
-
-    def _synthesise_(self, theta, moog_instance=None, **kwargs):
-
-        theta_dict = dict(zip(self.parameters, theta))
-        
-        # Parse abundances
-        abundances = {}
-        for parameter, value in theta_dict.iteritems():
-            if parameter[:2] == "Z_":
-                neutral_species = np.floor(utils.element_to_species(parameter[2:]))
-
-                abundances[neutral_species] = [value]
-                abundances[neutral_species + 0.1] = [value]
-
-        # Synthesise and return a spectrum
-        if moog_instance is not None:
-            dispersion, flux = moog_instance.synth(self.model_atmosphere_filename,
-                self.line_list_filename, abundances=abundances, **self.moog_kwargs)
-
-        else:
-            with moog.instance(prefix="moog") as moogsilent:
-                # Flux is a list because we can request multiple spectra from MOOG in one synthesis
-                dispersion, flux = moogsilent.synth(self.model_atmosphere_filename,
-                    self.line_list_filename, **self.moog_kwargs)
-
-        return (dispersion, flux)
-
-
-a = ModelSpectrum("marcs-sun.model", "linelists/hermes/lin56683new", "Fe")
-aa = ApproximateModelSpectrum("marcs-sun.model", "linelists/hermes/lin56683new", "Fe")
 data = np.loadtxt("spectra/uvessun2.txt", skiprows=1)
 
 class spectrum(object):
