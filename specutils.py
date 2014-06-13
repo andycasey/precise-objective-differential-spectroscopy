@@ -248,4 +248,47 @@ class Spectrum1D(object):
                             logging.warn("Could not save header key/value combination: %s = %s" % (key, value, ))
                 
                 hdu.writeto(filename, clobber=clobber)
+
+
+
+
+
+def profile(vsini, epsilon, dl, refwvl, dwl):
+
+    c = 299792.458 # km/s
+
+    vsini, epsilon = map(float, [vsini, epsilon])
+
+    dlmax = (vsini/c) * refwvl
+    c1 = 2.0 * (1 - epsilon) / (np.pi * dlmax * (1 - epsilon/3))
+    c2 = 0.5 * (epsilon / (dlmax * (1 - epsilon/3)))
+
+    result = np.zeros(len(dl))
+
+    x = dl/dlmax
+    indi = np.where(np.abs(x) < 1.0)[0]
+
+    result[indi] = c1 * np.sqrt(1 - x[indi]**2) + c2 * (1 - x[indi]**2)
+
+    # Not sure if this should have a factor of 2 or not. TODO: CHECK & TEST
+    result /= np.sum(result) * dwl
+
+    return result
+
+def broaden(dispersion, flux, epsilon, vsini):
+
+    # Assume evenly spaced array
+    delta_wl = np.diff(dispersion)[0]
+
+    # No special edge handling
+    N = len(flux)
+    smoothed_flux = np.zeros(N)
+
+    for i in xrange(N):
+        dl = dispersion[i] - dispersion
+        smoothed_flux[i] = np.sum(flux * profile(vsini, epsilon, dl, dispersion[i], delta_wl))
+
+    smoothed_flux *= delta_wl
+
+    return smoothed_flux
     
