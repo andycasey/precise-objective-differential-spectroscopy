@@ -23,15 +23,15 @@ def readfile(filename):
 version_regex = re.compile("__version__ = \"(.*?)\"")
 contents = readfile(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "unnamed", "__init__.py"))
+    "code", "__init__.py"))
 
 version = version_regex.findall(contents)[0]
 
-setup(name="unnamed",
+setup(name="honest-spectroscopy",
     version=version,
     author="Andrew R. Casey",
     author_email="arc@ast.cam.ac.uk",
-    packages=["unnamed"],
+    packages=["code"],
     url="http://www.github.com/andycasey/honest-spectroscopy/",
     license="MIT",
     description="Stellar spectroscopists are (largely) doing it wrong.",

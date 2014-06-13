@@ -9,11 +9,8 @@ virtualenv:
 before_install:
   - sudo apt-get install gfortran g77 libcfitsio3-dev python-matplotlib python-pyfits python-scipy
 install: 
-  - pip install coveralls
   - pip install -r requirements.txt --use-mirrors
 script:
-  - nosetests --with-coverage --cover-package=unnamed
-after_success:
-  coveralls
+  - nosetests
 notifications:
   email: false
