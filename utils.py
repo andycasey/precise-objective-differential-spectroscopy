@@ -2,18 +2,20 @@
 
 """ Utility functions """
 
-__author__ = "Andy Casey <andy@astrowizici.st>"
+from __future__ import division, print_function
 
+__author__ = "Andy Casey <andy@astrowizici.st>"
 __all__ = ["element_to_species", "species_to_element", "get_common_letters", \
     "find_common_start", "extend_limits", ]
 
 # Third party imports
 import numpy as np
 
-
 def element_to_species(element_repr):
-    """ Converts a string representation of an element and its ionization state
-    to a floating point """
+    """
+    Return the floating point representation for an element (atomic number +
+    ionization state/10)
+    """
     
     periodic_table = """H                                                  He
                         Li Be                               B  C  N  O  F  Ne
@@ -48,8 +50,9 @@ def element_to_species(element_repr):
 
 
 def species_to_element(species):
-    """ Converts a floating point representation of a species to a string
-    representation of the element and its ionization state """
+    """
+    Return the string representation for a species.
+    """
     
     periodic_table = """H                                                  He
                         Li Be                               B  C  N  O  F  Ne
@@ -70,16 +73,18 @@ def species_to_element(species):
         raise TypeError("species must be represented by a floating point-type")
     
     if species + 1 >= len(periodic_table) or 1 > species:
-        # Don"t know what this element is. It"s probably a molecule.
+        # Don't know what this element is. It"s probably a molecule.
         common_molecules = {
             112: ["Mg", "H"],
             606: ["C", "C"],
             607: ["C", "N"],
-            106: ["C", "H"]
+            106: ["C", "H"],
+            108: ["O", "H"]
         }
         if species in common_molecules.keys():
             elements_in_molecule = common_molecules[species]
-            if len(list(set(elements_in_molecule))): return "{0}_{1}".format(elements_in_molecule[0], len(elements_in_molecule))
+            if len(list(set(elements_in_molecule))): return "{0}_{1}".format(
+                elements_in_molecule[0], len(elements_in_molecule))
 
             return "-".join(elements_in_molecule)
 
@@ -91,17 +96,22 @@ def species_to_element(species):
     element = periodic_table[int(species) - 1]
     ionization = int(round(10 * (species - int(species)) + 1))
 
-    # The special cases
-    if element in ("C", "H", "He"): return element
-    return "%s %s" % (element, "I" * ionization)
+    return "{0} {1}".format(element, "I" * ionization)
 
 
 def get_common_letters(strlist):
+    """
+    Find the common letters in a list of strings.
+    """
     return "".join([x[0] for x in zip(*strlist) \
         if reduce(lambda a,b:(a == b) and a or None,x)])
 
 
 def find_common_start(strlist):
+    """
+    Find the common starting characters in a list of strings.
+    """
+
     strlist = strlist[:]
     prev = None
     while True:
@@ -115,18 +125,21 @@ def find_common_start(strlist):
 
 
 def extend_limits(values, fraction=0.10, tolerance=1e-2):
-    """ Extend the values of a list by a fractional amount """
+    """
+    Extend the values of a list by a fractional amount.
+    """
 
     values = np.array(values)
-    finite_indices = np.isfinite(values)
+    finite = np.isfinite(values)
 
-    if np.sum(finite_indices) == 0:
+    if np.sum(finite) == 0:
         raise ValueError("no finite values provided")
 
-    lower_limit, upper_limit = np.min(values[finite_indices]), np.max(values[finite_indices])
+    lower_limit, upper_limit = np.min(values[finite]), np.max(values[finite])
     ptp_value = np.ptp([lower_limit, upper_limit])
 
-    new_limits = lower_limit - fraction * ptp_value, ptp_value * fraction + upper_limit
+    new_limits = (lower_limit - fraction * ptp_value,
+        ptp_value * fraction + upper_limit)
 
     if np.abs(new_limits[0] - new_limits[1]) < tolerance:
         if np.abs(new_limits[0]) < tolerance:
