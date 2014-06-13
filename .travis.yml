@@ -1,15 +1,17 @@
 branches:
   only:
     - master
+    - develop
 language: python
 python:
+  - 2.6
   - 2.7
 virtualenv:
   system_site_packages: true
 before_install:
   - sudo apt-get install gfortran libcfitsio3-dev python-matplotlib python-pyfits python-scipy
 install: 
-  - pip install -r requirements.txt --use-mirrors
+  - pip install -r requirements.txt --use-mirrors --build /tmp/
 script:
   - nosetests
 notifications:
