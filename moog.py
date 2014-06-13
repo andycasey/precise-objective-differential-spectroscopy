@@ -233,7 +233,7 @@ class instance(object):
 
 
     def _format_synth_input(self, model_atmosphere_filename, line_list_filename, standard_out,
-        summary_out, abundances=None, terminal="x11", atmosphere=0, molecules=1, truedamp=1,
+        summary_out, abundances=None, terminal="x11", atmosphere=0, molecules=1, truedamp=0,
         lines=0, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, wl_edge=2,
         **kwargs):
 
