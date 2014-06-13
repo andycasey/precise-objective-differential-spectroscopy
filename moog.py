@@ -36,13 +36,14 @@ class instance(object):
     _executable = "MOOGSILENT"
     _acceptable_return_codes = (0, )
 
-    def __init__(self, twd_base_dir="/tmp/", prefix="moog", chars=10):
+    def __init__(self, twd_base_dir="/tmp/", prefix="moog", chars=10, debug=False):
         """ Initialisation class allows the user to specify a base temporary
         working directory """
 
         if prefix is None:
             prefix = ""
 
+        self.debug = debug
         self.chars = chars
         self.prefix = prefix
         self.twd_base_dir = twd_base_dir
@@ -167,7 +168,6 @@ class instance(object):
         return output
         
 
-
     def _format_abfind_input(self, model_atmosphere_filename, line_list_filename, standard_out,
         summary_out, terminal="x11", atmosphere=1, molecules=1, lines=1,
         freeform=0, flux_int=0, damping=1, units=0):
@@ -233,8 +233,8 @@ class instance(object):
 
 
     def _format_synth_input(self, model_atmosphere_filename, line_list_filename, standard_out,
-        summary_out, abundances=None, terminal="x11", atmosphere=1, molecules=1, truedamp=1,
-        lines=1, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, wl_edge=2,
+        summary_out, abundances=None, terminal="x11", atmosphere=0, molecules=1, truedamp=1,
+        lines=0, freeform=0, flux_int=0, damping=0, units=0, wl_step=0.01, wl_cont=2, wl_edge=2,
         **kwargs):
 
         # Set wavelength ranges if they don't exist
@@ -313,6 +313,14 @@ class instance(object):
                 
                 dispersion = np.arange(wl_min, wl_max + wl_step, wl_step)
     
+            elif line == "SPECTRUM DEPTHS\n":
+
+                wl_min = float(output[i + 2].split()[0].strip(":"))
+                wl_next = float(output[i + 3].split()[0].strip(":"))
+                wl_step = (wl_next - wl_min)/10.
+
+                dispersion = None
+            
             elif ': depths=' in line:
                 flux_data = line[19:].rstrip()
                 depths.extend(map(float, [flux_data[j:j+6].replace("******", "0") for j in xrange(0, len(flux_data), 6)]))
@@ -323,6 +331,9 @@ class instance(object):
         depths = np.array(depths)
         num_pixels = len(depths)/num_spectra
         
+        if dispersion is None:
+            dispersion = wl_min + np.arange(num_pixels) * wl_step
+
         if len(dispersion) > num_pixels:
             logger.warn("Dispersion points ({0}) did not equal flux points ({1}) for spectrum"
                 " returned by MOOG".format(len(dispersion), num_pixels))
@@ -332,10 +343,9 @@ class instance(object):
         for i in xrange(num_spectra):
             fluxes.append(1. - depths[i*num_pixels:(i+1)*num_pixels])
 
-        # Convert to spectra?
-        # TODO
+        assert len(set(map(len, fluxes))) == 1
+        assert len(dispersion) == len(fluxes[0])
 
-        # CHECK THAT THE LENGTHS ARE THE SAME
         return (dispersion, fluxes)
 
 
@@ -417,7 +427,7 @@ class instance(object):
 
     def __exit__(self, exit_type, value, traceback):
         # Remove the temporary working directory and any files in it
-        if exit_type not in (IOError, MOOGError):
+        if exit_type not in (IOError, MOOGError) and not self.debug:
             shutil.rmtree(self.twd)
         else:
             logger.info("Temporary directory {0} has been kept to allow debugging".format(self.twd))
