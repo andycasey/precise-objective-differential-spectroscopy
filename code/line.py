@@ -61,20 +61,21 @@ class Line(object):
         # Optimise.
         minimise = lambda theta: -ln_like(theta)
         return op.fmin(minimise, p0, xtol=xtol, ftol=ftol, maxfun=maxfun, maxiter=maxiter, disp=False, **kwargs)
-        
-"""
-x, y = np.loadtxt("data", unpack=True)
-yerr = np.array([0.1] * len(y))
-line_no_outliers = Line(x, y, yerr=yerr, outliers=False)
-m1, b1 = line_no_outliers.optimise()
 
-line_with_outliers = Line(x, y, yerr=yerr, outliers=True)
-m2, b2, po, yo, vo = line_with_outliers.optimise()
+if __name__ == "__main__":
 
-plt.errorbar(x, y, yerr=yerr, fmt=None, c='k')
-plt.scatter(x,y, facecolor='k')
-plt.plot(x, m1 * x + b1, 'r')
-plt.plot(x, m2 * x + b2, 'b')
-"""
+    # DEBUG MODE
+    x, y = np.loadtxt("data", unpack=True)
+    yerr = np.array([0.05] * len(y))
+    line_no_outliers = Line(x, y, yerr=yerr, outliers=False)
+    m1, b1 = line_no_outliers.optimise()
+
+    line_with_outliers = Line(x, y, yerr=yerr, outliers=True)
+    m2, b2, po, yo, vo = line_with_outliers.optimise()
+
+    plt.errorbar(x, y, yerr=yerr, fmt=None, c='k')
+    plt.scatter(x,y, facecolor='k')
+    plt.plot(x, m1 * x + b1, 'r')
+    plt.plot(x, m2 * x + b2, 'b')
 
 
