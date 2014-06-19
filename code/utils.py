@@ -6,7 +6,7 @@ from __future__ import division, print_function
 
 __author__ = "Andy Casey <andy@astrowizici.st>"
 __all__ = ["element_to_species", "species_to_element", "get_common_letters", \
-    "find_common_start", "extend_limits", ]
+    "find_common_start", "extend_limits"]
 
 # Third party imports
 import numpy as np
