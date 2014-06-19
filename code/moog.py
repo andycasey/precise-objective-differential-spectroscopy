@@ -132,7 +132,7 @@ class instance(object):
         return filename
 
 
-    def _format_ew_input(self, measurements, comment=None):
+    def _format_ew_input(self, measurements, comment=None, force_loggf=True):
         """
         measurments should be recarray
         """
@@ -140,26 +140,21 @@ class instance(object):
         output = comment.rstrip() if comment is not None else ""
         output += "\n"
 
-        line = "{0:10.3f} {1:9.3f} {2:8.2f} {3:6.2f}                             {4:5.1f}\n"
+        line = "{0:10.3f} {1:9.3f} {2:8.3f} {3:6.3f}                           {4:7.3f}\n"
 
         # Sort all the lines first transition, then by wavelength
-        measurements = sorted(measurements, key=itemgetter("species", "wavelength"))
+        wavelength_key = ["wavelength", "rest_wavelength"]["rest_wavelength" in measurements.dtype.names]
 
-        include_uncertainties = "u_equivalent_width" in measurements.dtype.names
+        # TODO - this might fail sometimes.
+        measurements[wavelength_key].sort()
+        measurements["species"].sort()
+
+        logging.warn("Ignoring any van Der Waal damping coefficients at the moment.")
+
         for i, measurement in enumerate(measurements):
-
             # TODO: Ignoring van Der Waal damping coefficients for the moment << implement if they exist!
-            output += line.format(*[measurement[col] for col in ["wavelength", "species",
+            output += line.format(*[measurement[col] for col in [wavelength_key, "species",
                 "excitation_potential", "loggf", "equivalent_width"]])
-
-            # If we have an uncertainty in equivalent width, we will propagate this to an
-            # uncertainty in abundance, so we will have two lines for each measurement
-            if include_uncertainties:
-                additional_line_data = [measurement[col] for col in ["wavelength", "species",
-                    "excitation_potential", "loggf"]]
-                additional_line_data.append(measurement["equivalent_width"] \
-                    + measurement["u_equivalent_width"])
-                output += line.format(*additional_line_data)
 
         if force_loggf and np.all(measurements["loggf"] > 0):
             warnings.warn("The atomic line list contains no lines with positive oscillator "
@@ -376,7 +371,7 @@ class instance(object):
         # Execute it, retrieve spectra
         result, stdout, stderr = self.execute(input_filename)
 
-        num_spectra = len(kwargs["abundances"].values()[0]) if "abundances" in kwargs else 1
+        num_spectra = len(kwargs["abundances"].values()[0]) if kwargs.get("abundances", None) is not None else 1
         spectrum = self._parse_synth_standard_output(standard_out, num_spectra)
 
         if not parallel:
@@ -404,8 +399,8 @@ class instance(object):
             for filename in ("batch.par", "abfind.std", "abfind.sum")]
         
         # Write the abfind file
-        with open(input_filename, "w") as fp:
-            fp.write(self._format_abfind_input(line_list_filename, model_atmosphere, standard_out,
+        with open(input_filename, "w+") as fp:
+            fp.write(self._format_abfind_input(model_atmosphere, line_list_filename, standard_out,
                 summary_out, **kwargs))
 
         # Execute MOOG
@@ -416,11 +411,13 @@ class instance(object):
         # Did we propagate uncertainties in equivalent width to MOOG?
         # TODO: These are one-sided 68% CIs as "uncertainties". We should really be propagating
         # the whole distribution of measured equivalent widths and rest wavelengths!
+        """
         if "u_equivalent_width" in measurements.dtype.names:
 
             # Create a new table with the uncertainties included
             abundances = nprcf.append_fields(abundances[::2], "u_abundance",
                 abundances[1::2] - abundances[::2], usemask=False)
+        """
 
         return abundances
 
