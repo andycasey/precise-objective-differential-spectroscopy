@@ -55,17 +55,17 @@ class ApproximateModelSpectrum(object):
         self.moog_instance = None
 
         # Determine the parameters
-        if v_rad is True:
-            self.parameters.append("v_rad")
-        elif v_rad is not False and isinstance(v_rad, (float, int)):
-            # Velocity is fixed.
-            self.fixed_parameters["v_rad"] = v_rad
-
         if convolve is True:
             self.parameters.append("convolve")
         elif convolve is not False and isinstance(convolve, (float, int)) and convolve > 0:
             # Convolution is fixed.
             self.fixed_parameters["convolve"] = convolve
+
+        if v_rad is True:
+            self.parameters.append("v_rad")
+        elif v_rad is not False and isinstance(v_rad, (float, int)):
+            # Velocity is fixed.
+            self.fixed_parameters["v_rad"] = v_rad
 
         self.continuum_order = -1
         if continuum is True:
@@ -94,7 +94,6 @@ class ApproximateModelSpectrum(object):
         self.moog_kwargs.update({
             "wl_min": np.min(wavelengths) - self.moog_kwargs["wl_edge"],
             "wl_max": np.max(wavelengths) + self.moog_kwargs["wl_edge"],
-            "wl_step": 0.001
         })
 
         # Ensure we haven't done anything silly
@@ -164,9 +163,10 @@ class ApproximateModelSpectrum(object):
         return mask
 
 
-    def optimise(self, data, p0=None, p0_abundance_range=[-2.5, 2.5], masks=None, xtol=0.01,
+    def optimise(self, data, p0=None, p0_abundance_range=[-1, 0, 1], masks=None, xtol=0.01,
         maxiter=10, full_output=False, op_kwargs=None):
 
+        print("Fitting as {0}, {1}".format(self.parameters, self.fixed_parameters))
         dispersion, flux, variance = data.dispersion, data.flux, data.variance
 
         # Slice the data, clean up non-finite fluxes, etc
@@ -180,12 +180,13 @@ class ApproximateModelSpectrum(object):
         finite = np.isfinite(flux)
 
         # Approximate the wavelength sampling for MOOG
-        #self.moog_kwargs["wl_step"] = np.median(np.diff(dispersion))
+        self.moog_kwargs["wl_step"] = np.median(np.diff(dispersion))
 
         if masks is None:
             masks = []
 
-        if p0 is None: p0 = {}
+        if p0 is None:
+            p0 = {"c_0": 1., "Pb": 0.5, "Vb": 1., "Yb": np.mean(flux)}
         p0 = [p0.get(parameter, 0) for parameter in self.parameters]
         p0_abundance_range = np.array(p0_abundance_range)
 
@@ -249,7 +250,7 @@ class ApproximateModelSpectrum(object):
                     ndimage.gaussian_filter(interpolated_flux, convolve, output=interpolated_flux)
 
                 # Any radial velocity to apply?
-                z = get_parameter("v_rad", 0)/299792458e-3
+                z = get_parameter("v_rad", 0)/299792458.0e-3
 
                 # Must match model dispersion onto observed dispersion
                 # TODO: YOU SHOULD DO THIS ON A DISPERSION THAT IS UNIFORM IN LOG-LAMBDA
@@ -333,9 +334,50 @@ class ApproximateModelSpectrum(object):
         return opt_p0
 
 
+"""
+line_lists = \
+['linelists/lin56466lab',
+ 'linelists/lin56514lab',
+ 'linelists/lin56523lab',
+ 'linelists/lin56613lab',
+ 'linelists/lin56790lab',
+ 'linelists/lin56802lab',
+ 'linelists/lin56894lab',
+ 'linelists/lin56960lab',
+ 'linelists/lin57047lab',
+ 'linelists/lin57054lab',
+ 'linelists/lin57164lab',
+ 'linelists/lin57204lab',
+ 'linelists/lin57208lab',
+ 'linelists/lin57244lab',
+ 'linelists/lin57317lab',
+ 'linelists/lin57322lab',
+ 'linelists/lin57394lab',
+ 'linelists/lin57418lab',
+ 'linelists/lin57520lab',
+ 'linelists/lin57663lab',
+ 'linelists/lin57750lab',
+ 'linelists/lin57784lab',
+ 'linelists/lin58067lab',
+ 'linelists/lin58092lab',
+ 'linelists/lin58100lab',
+ 'linelists/lin58218lab',
+ 'linelists/lin58236lab',
+ 'linelists/lin58480lab',
+ 'linelists/lin58481lab',
+ 'linelists/lin58496lab',
+ 'linelists/lin58531lab',
+ 'linelists/lin58550lab',
+ 'linelists/lin58587lab',
+ 'linelists/lin58595lab',
+ 'linelists/lin58611lab',
+ 'linelists/lin58623lab',
+ 'linelists/lin58664lab']
 
-aa = ApproximateModelSpectrum("lin58092lab", "marcs-sun.model", "Fe", v_rad=0,
-    convolve=True, continuum=False, outliers=True, continuum_order=1)
+models = []
+for line_list in line_lists:
+    models.append(ApproximateModelSpectrum(line_list, "marcs-sun.model", "Fe", v_rad=True,
+    convolve=True, continuum=True, outliers=True, continuum_order=0))
 
 data = np.loadtxt("spectra/uvessun2.txt", skiprows=1)
 
@@ -346,7 +388,8 @@ b = spectrum()
 
 b.dispersion = data[:,0]
 b.flux = data[:,1]
-b.variance =  np.array([0.0001] * len(data))
+b.variance =  np.array([0.000001] * len(data))
 
+# Fit it
 
-
+"""

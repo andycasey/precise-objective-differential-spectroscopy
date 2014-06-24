@@ -9,7 +9,10 @@ import os
 from time import time
 import cPickle as pickle
 from itertools import chain
+from random import choice
+from string import ascii_letters
 
+import emcee
 import numpy as np
 import numpy.lib.recfunctions as nprcf
 from scipy import optimize as op, ndimage
@@ -21,35 +24,71 @@ import specutils
 import utils
 import line
 
+from channel import SpectralChannel
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+solar_abundances = {
+    26: 7.50
+}
+count = 0.
 
+def ln_likelihood(theta, interpolator, equivalent_widths_filename, moogsilent, fprime=True):
 
-def sp_jacobian(stellar_parameters, *args):
-    """ Approximate the Jacobian of the stellar parameters and
-    minimisation parameters, based on calculations from the Sun """
+    global count
+    print(theta)
+    teff, xi, logg, m_h = theta
 
-    logger.info("Updated approximation of the Jacobian")
+    # Prior:
+    if 0 > xi:
+        return [np.inf]*len(theta)
 
-    teff, xi, logg, m_h = stellar_parameters
+    # Interpolate a model atmopshere.
+    atmosphere_filename = os.path.join(moogsilent.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
+    while os.path.exists(atmosphere_filename):
+        atmosphere_filename = os.path.join(moogsilent.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
 
-    # This is the black magic.
-    jacobian = np.array([
-        [ 5.4393e-08*teff - 4.8623e-04, -7.2560e-02*xi + 1.2853e-01,  1.6258e-02*logg - 8.2654e-02,  1.0897e-02*m_h - 2.3837e-02],
-        [ 4.2613e-08*teff - 4.2039e-04, -4.3985e-01*xi + 8.0592e-02, -5.7948e-02*logg - 1.2402e-01, -1.1533e-01*m_h - 9.2341e-02],
-        [-3.2710e-08*teff + 2.8178e-04,  3.8185e-03*xi - 1.6601e-02, -1.2006e-02*logg - 3.5816e-03, -2.8592e-05*m_h + 1.4257e-03],
-        [-1.7822e-08*teff + 1.8250e-04,  3.5564e-02*xi - 1.1024e-01, -1.2114e-02*logg + 4.1779e-02, -1.8847e-02*m_h - 1.0949e-01]
-    ])
-    return jacobian.T
+    # Calculate abundances from equivalent widths.
+    try:
+        interpolator.interpolate(atmosphere_filename, teff, logg, m_h, +0.4, xi)
+        abundances = moogsilent.abfind(atmosphere_filename, equivalent_widths_filename, parallel=True)
+    except:
+        return [np.inf]*len(theta)
+    
+    # Compare "observed" abundances - expected (input) abundance.
+    # ASSUME WE ARE ONLY DOING FE
+    
 
+    # Calculate the partial derivatives.
+    if fprime:
+        neutral = (abundances["species"] == 26.)
+        ionised = ~neutral
+        pre_condition = np.array([
+            line.Line(abundances["excitation_potential"], abundances["abundance"], outliers=False).optimise()[0],
+            line.Line(np.log10(abundances["equivalent_width"]/abundances["wavelength"]), abundances["abundance"],
+                outliers=False).optimise()[0],
+            0.1 * (np.mean(abundances[neutral]["abundance"]) - np.mean(abundances[ionised]["abundance"])),
+            0.1 * (np.mean(abundances["abundance"]) - (m_h + solar_abundances[26]))
+        ])
+        print(pre_condition, np.sum(pre_condition**2))
+
+        count += 1.
+        return pre_condition/count
+
+    else:
+        ivar = 1.0/np.array([0.02]*len(abundances))**2
+        ln_like = -0.5 * np.sum((abundances["abundance"] - (m_h + solar_abundances[26]))**2 * ivar - np.log(ivar))
+        print(theta, ln_like)
+
+        return ln_like
 
 class Star(object):
     """
     A model star.
     """
 
-    def __init__(self, model_atmospheres, transitions, spectra, **kwargs):
+    def __init__(self, model_atmospheres, transitions, spectra=None, **kwargs):
         """
         Create a model star.
 
@@ -59,8 +98,11 @@ class Star(object):
         """
 
         # Sort the spectra from blue to red
-        self.spectra = [spectra[index] for index in np.argsort([spectrum.dispersion[0] \
-            for spectrum in spectra])]
+        if spectra is None or len(spectra) == 0:
+            self.spectra = []
+        else:
+            self.spectra = [spectra[index] for index in np.argsort([spectrum.dispersion[0] \
+                for spectrum in spectra])]
 
         self.transitions = transitions
 
@@ -90,15 +132,24 @@ class Star(object):
         return None
 
 
-    def optimise_sp(self, p0=None, elements=("Fe", ), line_outliers=True, moog_kwargs=None, **kwargs):
+    def optimise_sp(self, p0=None, elements=("Fe", ), measure=True, line_outliers=True, moog_kwargs=None, **kwargs):
         """
         Calculate equivalent widths for all transitions in all channels, then optimise the stellar
         parameters.
         """
 
         if p0 is None:
-            raise NotImplementedError("need to test limits with an atmosphere interpolator")
 
+            initial_pos = np.array([
+                np.random.uniform(3000, 8000),
+                1,
+                np.random.uniform(0, 5),
+                np.random.uniform(-5, 1)
+                ])
+
+            #p0 = [4500, 1.0, 2.0, -1]
+        else:
+            initial_pos = p0
         if moog_kwargs is None:
             moog_kwargs = {}
 
@@ -106,27 +157,34 @@ class Star(object):
         species = map(utils.element_to_species, elements)
         species += [0.1 + each for each in species]
 
-        # Measure equivalent widths in all channels.
-        balance_transitions = []
-        for i, channel in enumerate(self.channels):
-            if "plot_filename" in kwargs:
-                channel_kwargs = kwargs.copy()
-                channel_kwargs["plot_filename"] = channel_kwargs["plot_filename"].format(i)
-            else:
-                channel_kwargs = kwargs.copy()
-            xopt, fopt, model_flux = channel.optimise(**channel_kwargs)
+        if measure:
+            # Measure equivalent widths in all channels.
+            balance_transitions = []
+            for i, channel in enumerate(self.channels):
+                if "plot_filename" in kwargs:
+                    channel_kwargs = kwargs.copy()
+                    channel_kwargs["plot_filename"] = channel_kwargs["plot_filename"].format(i)
+                else:
+                    channel_kwargs = kwargs.copy()
+                xopt, fopt, model_flux = channel.optimise(**channel_kwargs)
 
-            # Identify all the species we need.
-            species_indices = np.zeros(len(channel.transitions), dtype=bool)
+                # Identify all the species we need.
+                species_indices = np.zeros(len(channel.transitions), dtype=bool)
+                for each in species:
+                    species_indices += (channel.transitions["species"] == each)
+                balance_transitions.append(channel.transitions[species_indices])
+
+            # Use the table of measured equivalent widths to optimise stellar parameters.
+            balance_transitions = nprcf.stack_arrays(balance_transitions, usemask=False)
+
+        else:
+            balance_transitions = []
+            species_indices = np.zeros(len(self.transitions), dtype=bool)
             for each in species:
-                species_indices += (channel.transitions["species"] == each)
-            balance_transitions.append(channel.transitions[species_indices])
+                species_indices += (self.transitions["species"] == each)
+            balance_transitions = self.transitions[species_indices]
 
-        balance_transitions = nprcf.stack_arrays(balance_transitions, usemask=False)
-
-        # Use the table of measured equivalent widths to optimise stellar parameters.
         # We'll need an instance of MOOG for this.
-
         with moog.instance("/tmp", debug=True) as moogsilent:
 
             # Write transitions and equivalent widths to file.
@@ -134,21 +192,15 @@ class Star(object):
             with open(ew_filename, "w+") as fp:
                 fp.write(moogsilent._format_ew_input(balance_transitions, **moog_kwargs))
             
-            """
-            abundances = moogsilent.abfind("marcs-sun.model", ew_filename, **moog_kwargs)
-            plt.scatter(np.log(abundances["equivalent_width"]/abundances["wavelength"]), abundances["abundance"])
-            raise a
-            """
 
             fill_value = 1.
-
             def minimise(theta):
 
                 # Parse theta
                 teff, xi, logg, m_h= theta[:4]
                 alpha_m = 0.
 
-                if 0 > xi: return np.array([fill_value] * 4)
+                if 0 > xi: return np.array([fill_value] * len(theta))
 
                 # Check to see if we have already executed MOOG for these parameters given some
                 # tolerance, so that we can avoid unnecessary calls to MOOG.
@@ -159,20 +211,20 @@ class Star(object):
                     thermal_structure = self.model_atmospheres.interpolate_thermal_structure(
                         teff, logg, m_h, alpha_m)
                 except:
-                    return np.array([fill_value] * 4)
+                    return np.array([fill_value] * len(theta))
 
                 self.model_atmospheres.parser.write_atmosphere(atmosphere_filename,
                     teff, logg, m_h, xi, thermal_structure, clobber=True)
 
                 # Convert equivalent widths to abundances.
-                results = moogsilent.abfind(atmosphere_filename, ew_filename, **kwargs)
+                results = moogsilent.abfind(atmosphere_filename, ew_filename, **moog_kwargs)
 
-                # Calculate trend lines, allowing for outliers.
+                # Calculate trend lines, allowing for outliers where appropriate.
                 # Trend lines in:
                 # - reduced equivalent width vs abundance
                 # - excitation potential vs abundance
-                # - input model atmosphere - mean Fe abundance?
-                # - mean Fe abundance - mean Fe II abundance?
+                # - input model atmosphere - mean Fe abundance
+                # - mean Fe abundance - mean Fe II abundance
                 excitation_balance = line.Line(x=results["excitation_potential"], y=results["abundance"],
                     yerr=np.array([0.05] * len(results)), outliers=line_outliers).optimise()
 
@@ -193,357 +245,99 @@ class Star(object):
                         - np.median(results[ionised_species]["abundance"]))/10.
 
                 metallicity_balance = np.median((results[(results["species"] == species[0])]["abundance"] \
-                    - (m_h + 7.50))/10.) # TODO
+                    - (m_h + solar_abundances[int(species[0])]))/10.) # TODO
 
-                # Return a sum of slopes.
                 components = np.array([excitation_balance[0], turbulence_balance[0], ionisation_balance,
                     metallicity_balance])**2
 
                 print(theta, np.sum(components))
                 return components
 
-            # Run minimise for p0.
-            def scalar_min(x):
-                result = np.sum(minimise(x))
-                print(x, result)
-                return result
-
-            # scipy optimise
-            result = op.fsolve(minimise, [5777, 1.06, 4.40, 0.01], fprime=sp_jacobian, col_deriv=1, epsfcn=0,
+            def minimise_scalar(theta):
+                return np.sum(minimise(theta))
+                
+            # Do an initial optimisation with fsolve, then one with fmin from the best point?
+            vector_opt = op.fsolve(minimise, p0, fprime=utils.sp_jacobian, col_deriv=1, epsfcn=0,
                 xtol=1e-10, full_output=1, maxfev=100)
 
+            scalar_opt = op.fmin(minimise_scalar, vector_opt[0])
             raise a
         return result
 
 
-    def infer(self, ):
-        """
-        Infer the parameters of the model, given the data.
-
-        Parameters:
-        teff            : effective temperature of the atmosphere
-        logg            : surface gravity of the atmosphere
-        [M/H]           : mean metallicity of the atmosphere (e.g. this is *not* always [Fe/H])
-        [alpha/M]       : mean alpha enhancement of the atmosphere over the mean metallicity
-        xi              : microturbulence in the model atmosphere
-        {z}_{chan}      : redshift in each observed channel (1 per channel)
-        {c_i}_{chan}    : continuum coefficients in each observed channel (3-4 per channel)
-        {sigma}_{chan}  : gaussian smoothing kernel in each observed channel (1 per channel)
-        log_X_{line}    : abundance of every line of interest (~309 parameters?!)
-
-        Total number of free parameters: 5 + 4 + 4*4 + 4 + 309 --> 338 free parameters. Fuck.
-
-        Use masks around each line to identify which pixels to use in the comparison. This will
-        yield us posterior probability distributions in all parameters given the data. I admit,
-        the problem description looks daunting, but I can't think of any other way to get the
-        correct PDFs.
-        """
-
-        raise NotImplementedError
-
-
-class SpectralChannel(object):
-
-    def __init__(self, data, transitions, redshift=False, continuum_order=-1, outliers=False,
-        wl_tolerance=0, wl_cont=1):
-
-        self.dispersion = data.dispersion
-        self.data = data.flux
-        self._finite = np.isfinite(self.data)
-        self.variance = data.variance
-
-        self.transitions = transitions
-
-        # Does the transitions table have an equivalent width field? If not, add one.
-        if "equivalent_width" not in self.transitions.dtype.names:
-            self.transitions = nprcf.append_fields(self.transitions, "equivalent_width",
-                [np.nan] * len(self.transitions), usemask=False)
-
-        self.wl_cont = wl_cont
-        self.redshift = redshift
-        self.outliers = outliers
-        self.wl_tolerance = wl_tolerance
-        self.continuum_order = continuum_order
-
-        # Create parameter list.
-        self.parameters = []
-        if redshift: self.parameters.append("z")
-        self.parameters.append("smoothing_sigma")
-        self.parameters.extend(["c_{0}".format(i) for i in range(continuum_order + 1)])
-
-        # Outliers?
-        if outliers:
-            self.parameters.extend(["Po", "Vo", "Yo"])
-            
-        # Line depths.
-        self.parameters.extend(["ld_{0}".format(i) for i in range(len(transitions))])
-
-        # Are wavelengths allowed to vary?
-        if wl_tolerance > 0:
-            self.parameters.extend(["wl_{0}".format(i) for i in range(len(transitions))])
-
-        # Check for nearby-ish lines.
-        sorted_wavelengths = np.sort(self.transitions["rest_wavelength"])
-        distances = np.diff(sorted_wavelengths)
-        if wl_cont > 0 and wl_cont > np.min(distances):
-            nearby_line_indices = np.where(wl_cont > distances)[0]
-            for nearby_index in nearby_line_indices:
-                logging.warn("Transitions at {0:.2f} and {1:.2f} are very close ({2:.2f} < {3:.2f} Angstroms)".format(
-                    sorted_wavelengths[nearby_index], sorted_wavelengths[nearby_index + 1], 
-                    float(np.abs(np.diff(sorted_wavelengths[nearby_index:nearby_index+2]))), wl_cont))
-
-
-    def _fit(self, theta, full_output, verbose=False):
-
-        # Create continuum shape.
-        if self.continuum_order > -1:
-            continuum_coefficients = [theta[self.parameters.index("c_{0}".format(i))] \
-                for i in range(self.continuum_order + 1)]
-            continuum = np.polyval(continuum_coefficients, self.dispersion)
+    def infer_sp_from_ew(self, p0, walkers=50, burn=900, sample=100):
         
-        else:
-            continuum = np.ones(len(self.data))
-        
-        if self.outliers:
-            Po, Yo, Vo = [theta[self.parameters.index(each)] for each in ("Po", "Yo", "Vo")]
-            if not (1 > Po > 0) or 0 > Vo:
-                return np.inf
+        p0 = [4000, 1.06, 1.0, -1]
+        #p0 = [np.random.uniform(*boundaries) for boundaries in self.model_atmospheres.boundaries]
+         
+        p0 = np.array([
+            np.random.uniform(3000, 8000),
+            np.random.uniform(0, 3),
+            np.random.uniform(0, 5),
+            np.random.uniform(-5, 1)
+        ])
 
-        # Add absorption lines.
-        for i, transition in enumerate(self.transitions):
-            if self.wl_tolerance > 0:
-                wavelength = theta[self.parameters.index("wl_{0}".format(i))]
+   
+        #teff, xi, logg, m_h
+        with moog.instance(debug=True) as moogsilent:
 
-            else:
-                wavelength = transition["rest_wavelength"]
+            with open("ews", "w+") as fp:
+                fp.write(moogsilent._format_ew_input(self.transitions[self.transitions["species"].astype(int) == 26]))
 
-            sigma = theta[0]
-            depth = theta[self.parameters.index("ld_{0}".format(i))]
-            if not (1 >= depth >= 0) or 0 > sigma \
-            or abs(wavelength - transition["rest_wavelength"]) > self.wl_tolerance:
-                return np.inf
+            #scalar_opt = lambda theta: ln_likelihood(theta, self.model_atmospheres, "ews", moogsilent)
+            newton = op.fsolve(ln_likelihood, p0, args=(self.model_atmospheres, "ews", moogsilent), fprime=utils.sp_jacobian,
+                    col_deriv=1, epsfcn=0, xtol=1e-10, full_output=1)
 
-            z = args[0] if self.redshift else 0
-            wavelength *= (1. + z)
+            raise a
+            p0 = op.fmin(scalar_opt, p0)
 
-            if self.wl_cont > 0:
-                indices = self.dispersion.searchsorted([
-                    wavelength - self.wl_cont,
-                    wavelength + self.wl_cont
-                ])
-                x = self.dispersion.__getslice__(*indices)
-                y = continuum.__getslice__(*indices)
+            ndim = len(p0)
+            sampler = emcee.EnsembleSampler(walkers, ndim, ln_likelihood,
+                args=(self.model_atmospheres, "ews", moogsilent), threads=24)
 
-                continuum.__setslice__(indices[0], indices[1],
-                    y * self._absorption_line_(wavelength, depth, sigma, x=x)
-                )
+            mean_acceptance_fractions = np.zeros(burn + sample)
+            initial_pos = np.array([p0 + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
+            for i, (pos, lnprob, rstate) in enumerate(sampler.sample(initial_pos, iterations=burn)):
+                mean_acceptance_fractions[i] = np.mean(sampler.acceptance_fraction)
+                logger.info(u"Sampler has finished step {0:.0f} with <a_f> = {1:.3f}, maximum log probability"\
+                    " in last step was {2:.3e}".format(i + 1, mean_acceptance_fractions[i],
+                        np.max(sampler.lnprobability[:, i])))
 
-            else:
-                continuum *= self._absorption_line_(wavelength, depth, sigma)
+                if mean_acceptance_fractions[i] in (0, 1):
+                    raise RuntimeError("mean acceptance fraction is {0:.0f}!".format(mean_acceptance_fractions[i]))
 
-        ivar = 1.0/self.variance
-        chi_sq = (continuum - self.data)**2 * ivar
-        
-        if self.outliers:
+            # Reset the chains and sample.
+            logger.info("Resetting chain...")
+            chain, lnprobability = sampler.chain, sampler.lnprobability
+            sampler.reset()
 
-            signal_ln_like = -0.5 * (chi_sq - np.log(ivar))
+            logger.info("Sampling posterior...")
+            for j, state in enumerate(sampler.sample(pos, iterations=sample)):
+                mean_acceptance_fractions[i + j + 1] = np.mean(sampler.acceptance_fraction)
 
-            ivar = 1.0/(self.variance + Vo)
-            outlier_ln_like = -0.5 * ((continuum - Yo)**2 * ivar - np.log(ivar))
+            raise a
 
-            # Make this the negative log-likelihood, since this function will only be used in optimisation.
-            ln_like = -np.sum(np.logaddexp(np.log(1-Po) + signal_ln_like, np.log(Po) + outlier_ln_like))
+"""
+Infer the parameters of the model, given the data.
 
-            if verbose:
-                print(ln_like)
-            
-            if full_output:
-                return (ln_like, continuum)
-            return ln_like
+Parameters:
+teff            : effective temperature of the atmosphere
+logg            : surface gravity of the atmosphere
+[M/H]           : mean metallicity of the atmosphere (e.g. this is *not* always [Fe/H])
+[alpha/M]       : mean alpha enhancement of the atmosphere over the mean metallicity
+xi              : microturbulence in the model atmosphere
+{z}_{chan}      : redshift in each observed channel (1 per channel)
+{c_i}_{chan}    : continuum coefficients in each observed channel (3-4 per channel)
+{sigma}_{chan}  : gaussian smoothing kernel in each observed channel (1 per channel)
+log_X_{line}    : abundance of every line of interest (~309 parameters?!)
 
-        # No outlier modelling; just return chi-sq.
-        chi_sq = np.sum(chi_sq)
-        if verbose:
-            print(chi_sq)
-        if full_output:
-            return (chi_sq, continuum)
-        return chi_sq
+Total number of free parameters: 5 + 4 + 4*4 + 4 + 309 --> 338 free parameters. Fuck.
 
-
-    def optimise(self, force=False, verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
-        plot_clobber=False):
-        # Optimise the channel and line parameters.
-
-        op_line_kwargs = { "xtol": 1e-8, "maxfun": 10e3, "maxiter": 10e3,
-            "full_output": True, "disp": False }
-        op_channel_kwargs = { "ftol": 1e-3, "maxfun": 10e4, "maxiter": 10e4,
-            "full_output": True, "disp": False } 
-
-        if line_kwargs is not None:
-            op_line_kwargs.update(line_kwargs)
-        if channel_kwargs is not None:
-            op_channel_kwargs.update(channel_kwargs)
-        
-        # Let's do a first pass for each line, then we'll iterate on the channel globally.
-        default_p0 = {
-            "z": 0,
-            "smoothing_sigma": 0.1,
-            "Po": 0.5,
-            "Yo": np.median(self.data[self._finite]),
-            "Vo": np.std(self.data[self._finite])**2
-        }
-
-        # Wavelengths
-        default_p0.update(dict(zip(
-            ["wl_{0}".format(i) for i in range(len(self.transitions))],
-            [each["rest_wavelength"] for each in self.transitions]
-        )))
-
-        # Continuum coefficients
-        if self.continuum_order >= 0:
-            continuum_coefficients = np.polyfit(self.dispersion, self.data, self.continuum_order)
-            default_p0.update(dict(zip(
-                ["c_{0}".format(i) for i in range(self.continuum_order + 1)],
-                continuum_coefficients
-            )))
-
-        continuum_shape = np.ones(len(self.data))
-        if self.continuum_order > -1:
-            continuum_shape *= np.polyval(continuum_coefficients, self.dispersion)
-
-        xopts = []
-        # Fit each line using the continuum we've set.
-        for i, transition in enumerate(self.transitions):
-
-            def fit_absorption_line(args, continuum, full_output):
-                
-                continuum = continuum.copy()
-
-                if self.wl_tolerance > 0:
-                    depth, sigma, wavelength = args
-
-                else:
-                    depth, sigma = args
-                    wavelength = transition["rest_wavelength"]
-
-                if not (1 > depth > 0) or 0 > sigma or abs(wavelength - transition["rest_wavelength"]) > self.wl_tolerance:
-                    return np.inf
-
-                z = args[0] if self.redshift else 0
-                wavelength *= (1. + z)
-
-                if self.wl_cont > 0:
-                    indices = self.dispersion.searchsorted([
-                        wavelength - self.wl_cont,
-                        wavelength + self.wl_cont
-                    ])
-                    x = self.dispersion.__getslice__(*indices)
-                    y = continuum.__getslice__(*indices)
-
-                    continuum.__setslice__(indices[0], indices[1],
-                        y * self._absorption_line_(wavelength, depth, sigma, x=x)
-                    )
-
-                else:
-                    continuum *= self._absorption_line_(wavelength, depth, sigma)
-
-                chi_sq = np.sum((continuum - self.data)**2/self.variance)
-                if full_output:
-                    return (chi_sq, continuum)
-                return chi_sq
-
-            index = self.dispersion.searchsorted(transition["rest_wavelength"])
-
-            line_p0 = [1. - self.data[index]/continuum_shape[index], default_p0["smoothing_sigma"]]
-            if self.wl_tolerance > 0:
-                line_p0.append(transition["rest_wavelength"])
-
-            xopt, fopt, niter, nfuncs, warnflag = op.fmin(fit_absorption_line, line_p0, args=(continuum_shape, False),
-                **op_line_kwargs)
-            xopts.append(xopt)
-            if warnflag > 0:
-                message = [
-                    "Che problem?",
-                    "Maximum number of function evaluations made",
-                    "Maximum number of iterations made"
-                ]
-                logging.warn("{0} for transition at {1}".format(message[warnflag], transition["rest_wavelength"])) 
-
-            # Update the default_p0 values.
-            if self.wl_tolerance > 0:
-                default_p0["wl_{0}".format(i)] = xopt[2]
-            default_p0["ld_{0}".format(i)] = np.clip(xopt[0], 0, 1)
-
-        default_p0["smoothing_sigma"] = abs(np.median([xopt[1] for xopt in xopts]))
-        
-        # Optimise the parameters globally if required.
-        # Note: the smoothing kernel is always a global parameter, but the median of the line sigmas
-        #       is a sufficient approximation. So here we are just checking for either redshift or
-        #       continuum coefficients.
-        channel_p0 = np.array([default_p0[parameter] for parameter in self.parameters])
-        if self.continuum_order > -1 or "z" in self.parameters or force:
-            xopt, fopt, niter, nfuncs, warnflag = op.fmin(self._fit, channel_p0, args=(False, verbose),
-                **op_channel_kwargs)
-            if warnflag > 0:
-                message = [
-                    "Che problem?",
-                    "Maximum number of function evaluations made",
-                    "Maximum number of iterations made"
-                ]
-                logging.warn("{0} for channel fit. Optimised values may be (even more) inaccurate.".format(
-                    message[warnflag]))
-
-        else:
-            xopt = channel_p0
-
-        """
-        fig, ax = plt.subplots()
-        ax.plot(self.dispersion, self.data,'k')
-        try:
-            ax.plot(self.dispersion, self._fit(channel_p0, True)[1], 'r')
-        except:
-            None
-        ax.plot(self.dispersion, self._fit(xopt, True)[1], 'b')
-        raise a
-        """
-
-        fopt, model = self._fit(xopt, True)
-
-        if plot_filename is not None:
-
-            # Produce a plot.
-            """
-            continuum = continuum_shape.copy()
-            for transition, result in zip(self.transitions, line_fits):
-                if self.wl_tolerance > 0:
-                    depth, sigma, wavelength = result["x"]
-                else:
-                    depth, sigma = result["x"]
-                    wavelength = transition["rest_wavelength"]
-
-                continuum *= self._absorption_line_(wavelength, depth, sigma)
-            """
-            fig, ax = plt.subplots(figsize=(50, 2))
-            ax.plot(self.dispersion, self.data, 'k')
-            ax.plot(self.dispersion, model, 'b')
-            ax.set_xlim(self.dispersion[0], self.dispersion[-1])
-            ax.set_ylim(0.5, 1.2)
-            fig.savefig(plot_filename, clobber=plot_clobber)
-            plt.close(fig)
-
-        # Calculate equivalent widths in the same units as the dispersion.
-        logging.warn("Assuming spectral dispersion units are Angstroms. Measured equivalent widths stored as mA.")
-        self.transitions["equivalent_width"] = np.array([xopt[self.parameters.index("ld_{0}".format(i))] \
-            for i in range(len(self.transitions))]) * xopt[0] * 1000. * 2.65 # TODO: Check integral.
-        return (xopt, fopt, model)
-
-
-    def _absorption_line_(self, wavelength, depth, sigma, x=None):
-        if x is None:
-            x = self.dispersion
-        return 1. - depth * np.exp(-(x - wavelength)**2 / (2 * sigma**2))
-
-
+Use masks around each line to identify which pixels to use in the comparison. This will
+yield us posterior probability distributions in all parameters given the data. I admit,
+the problem description looks daunting, but I can't think of any other way to get the
+correct PDFs.
+"""
 
 
 class spectrum(object):
@@ -610,4 +404,10 @@ Star(spectral_data, atmospheres, transitions)
 
 (3) star.infer(p0)
 """
+
+
+with open("yong-2012-ngc6752-table2-mg1.pkl", "rb") as fp:
+    transitions = pickle.load(fp)
+yong_star = Star("Castelli & Kurucz (2003)", transitions, [], wl_tolerance=0.1)
+#yong_star.infer_sp_from_ew(None)
 

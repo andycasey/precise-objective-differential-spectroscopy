@@ -381,22 +381,29 @@ class instance(object):
         return spectrum
 
 
-    def abfind(self, model_atmosphere, line_list_filename, **kwargs):
+    def abfind(self, model_atmosphere, line_list_filename, parallel=False, **kwargs):
         """ Call `abfind` in MOOG """
 
         model_atmosphere = self._cp_to_twd(model_atmosphere)
         line_list_filename = self._cp_to_twd(line_list_filename)
 
-        """
-        # Write the equivalent widths to file
-        os.path.join(self.twd, "ews")
-        with open(line_list_filename, "w") as fp:
-            fp.write(self._format_ew_input(measurements, **kwargs))
-        """
+        # Prepare the input and output filenames.
+        if not parallel:
+            input_filename, standard_out, summary_out = [os.path.join(self.twd, filename) \
+                for filename in ("batch.par", "abfind.std", "abfind.sum")]
+        
+        else:
+            input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
+            while os.path.exists(input_filename):
+                input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
 
-        # Prepare the input and output filenames
-        input_filename, standard_out, summary_out = [os.path.join(self.twd, filename) \
-            for filename in ("batch.par", "abfind.std", "abfind.sum")]
+            standard_out = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".out")
+            while os.path.exists(standard_out):
+                standard_out = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".out")
+
+            summary_out = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".sum")
+            while os.path.exists(summary_out):
+                input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".sum")
         
         # Write the abfind file
         with open(input_filename, "w+") as fp:
@@ -404,7 +411,7 @@ class instance(object):
                 summary_out, **kwargs))
 
         # Execute MOOG
-        result, stdout, stderr = self.execute()
+        result, stdout, stderr = self.execute(input_filename)
 
         abundances = self._parse_abfind_summary_output(summary_out)
 
@@ -418,6 +425,8 @@ class instance(object):
             abundances = nprcf.append_fields(abundances[::2], "u_abundance",
                 abundances[1::2] - abundances[::2], usemask=False)
         """
+        # Remove in/out files.
+        map(os.remove, [input_filename, standard_out, summary_out])
 
         return abundances
 

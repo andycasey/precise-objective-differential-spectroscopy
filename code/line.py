@@ -10,11 +10,12 @@ __all__ = ["Line"]
 class Line(object):
     """ A straight line model. """
     
-    def __init__(self, x, y, yerr, outliers=True):
+    def __init__(self, x, y, yerr=None, outliers=True):
 
         assert len(x) == len(y)
-        assert len(yerr) == len(y)
-
+        if yerr is not None:
+            assert len(y) == len(yerr)
+        
         self.x = x
         self.y = y
         self.yerr = yerr
@@ -36,6 +37,10 @@ class Line(object):
         p0 = [slope, intercept]
         if self.outliers:
             p0.extend([0.5, np.median(self.y), np.std(self.y)])
+
+        elif self.yerr is None:
+            # No errors, no outliers.
+            return [slope, intercept]
 
         # Create the likelihood function.
         def ln_like(theta):

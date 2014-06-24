@@ -28,6 +28,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 class AtmosphereParser(object):
     """Base class for all AtmosphereParser objects.
@@ -864,7 +865,7 @@ class AtmosphereInterpolator:
     
     """
     
-    def __init__(self, models_folder, parser, logarithmic_columns=[2, 3]):
+    def __init__(self, models_folder, parser, logarithmic_columns=[2,3]):
         """Initialises an class for interpolating atmospheres from existing
         atmosphere model files.
         
@@ -916,12 +917,16 @@ class AtmosphereInterpolator:
                 points = np.zeros((len(filenames), len(point)))
             points[i, :] = point
         
+        self.boundaries = [(min(points[:, i]), max(points[:, i])) for i in range(points.shape[1])]
 
         # Before scaling the grid points we should be interpolating [Fe/H], [alpha/Fe], and surface gravity in logarithmic space
-        for column in logarithmic_columns:
-            points[:, column] = pow(10, points[:, column])
+        if logarithmic_columns is None:
+            self.logarithmic_columns = []
+        else:
+            self.logarithmic_columns = logarithmic_columns
         
-        self.logarithmic_columns = logarithmic_columns
+        for column in self.logarithmic_columns:
+            points[:, column] = pow(10, points[:, column])
         
         self.points = self.scale_gridpoints(points)
         self.filenames = filenames
@@ -939,6 +944,7 @@ class AtmosphereInterpolator:
         points : `np.array`
             A grid of points to scale down to between zero and unity.
         """
+        return points
         
         try: (self.scales, self.offsets)
         except AttributeError: self.get_scales(points)
@@ -961,6 +967,7 @@ class AtmosphereInterpolator:
         n = points.shape[1]
         self.offsets = np.zeros(n)
         self.scales = np.ones(n)
+        return np.vstack([self.offsets, self.scales])
         
         for column in xrange(n):
             offset, scale = np.min(points[:, column]), np.max(points[:, column])
@@ -979,6 +986,7 @@ class AtmosphereInterpolator:
         point : list containing floats
             The grid point to be scaled down to between zero and unity.
         """
+        return point
         
         try: (self.scales, self.offsets)
         except AttributeError: self.get_scales()
@@ -996,6 +1004,7 @@ class AtmosphereInterpolator:
             The grid point (between zero and unity) to scale back to a physical
             value.
         """
+        return point
         
         try: (self.scales, self.offsets)
         except AttributeError: raise ArithmeticError("No scales or offsets have been applied to the grid -- cannot descale point.")
@@ -1163,9 +1172,10 @@ class AtmosphereInterpolator:
             else:
                 interpolated_deck = scipy.interpolate.griddata(subset_points, subset_values, interpolated_point.reshape(1, len(interpolated_point))).reshape(thermal_structure_shape)
         except:
-            logger.debug("Interpolator fell over:")
+            logger.debug("Interpolator fell over: {0}".format(point))
             logger.debug(subset_points.shape)
             logger.debug(interpolated_point.shape)
+            logger.debug(interpolated_deck)
             raise
             
         if np.all(np.isnan(interpolated_deck)):
