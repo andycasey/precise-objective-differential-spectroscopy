@@ -17,7 +17,7 @@ import numpy as np
 import numpy.lib.recfunctions as nprcf
 from scipy import optimize as op, ndimage
 
-import atmosphere
+import atmospheres
 import model
 import moog
 import specutils
@@ -32,7 +32,45 @@ logger.setLevel(logging.DEBUG)
 solar_abundances = {
     26: 7.50
 }
-count = 0.
+
+def excitation_ionisation_equilibria(theta, model_atmospheres, equivalent_width_filename, moogsilent,
+    line_outliers=False):
+    
+    no_result = np.array([np.inf]*len(theta))
+    teff, xi, logg, m_h = theta
+
+    # Prior:
+    if 0 > xi:
+        print(theta, "0>xi")
+        return no_result
+
+    # Interpolate a model atmopshere.
+    atmosphere_filename = os.path.join(moogsilent.twd, "".join([choice(ascii_letters) \
+        for _ in xrange(5)]) + ".in")
+    while os.path.exists(atmosphere_filename):
+        atmosphere_filename = os.path.join(moogsilent.twd, "".join([choice(ascii_letters) \
+            for _ in xrange(5)]) + ".in")
+
+    # Calculate abundances from equivalent widths.
+    try:
+        model_atmospheres.interpolate([teff, logg, m_h], xi, atmosphere_filename)
+        abundances = moogsilent.abfind(atmosphere_filename, equivalent_width_filename, parallel=True)
+    except:
+        print(theta, "fail")
+        return no_result
+
+    neutral = (abundances["species"] == 26.)
+    ionised = ~neutral
+    components = np.array([
+        line.Line(abundances["excitation_potential"], abundances["abundance"], outliers=line_outliers).optimise()[0],
+        line.Line(np.log10(abundances["equivalent_width"]/abundances["wavelength"]), abundances["abundance"],
+            outliers=line_outliers).optimise()[0],
+        0.1 * (np.median(abundances[neutral]["abundance"]) - np.median(abundances[ionised]["abundance"])),
+        0.1 * (np.median(abundances["abundance"]) - (m_h + solar_abundances[26]))
+    ])
+    print(theta, np.sum(components**2))
+    return components
+
 
 def ln_likelihood(theta, interpolator, equivalent_widths_filename, moogsilent, fprime=True):
 
@@ -88,11 +126,11 @@ class Star(object):
     A model star.
     """
 
-    def __init__(self, model_atmospheres, transitions, spectra=None, **kwargs):
+    def __init__(self, model_atmosphere_wildmask, transitions, spectra=None, **kwargs):
         """
         Create a model star.
 
-        atmospheres : an atmosphere interpolator
+        model_atmosphere_wildmask : wildmask to match model atmosphere files
         transitions : a record array of transitions and relevant synthesis line lists
         spectra : list of spectrum1D objects representing the observed data
         """
@@ -119,203 +157,59 @@ class Star(object):
             previous_order_max_disp = max_disp
 
         # Create the atmosphere interpolator.
-        if model_atmospheres not in atmosphere.parsers:
-            raise KeyError("No matching model atmospheres found. Installed types are: {0}".format(
-                ", ".join(atmosphere.parsers.keys())))
-        folder, parser = atmosphere.parsers[model_atmospheres]
-        self.model_atmospheres = atmosphere.AtmosphereInterpolator(folder, parser())
+        self.model_atmospheres = atmosphere.Interpolator(model_atmosphere_wildmask)
 
         # Create a list of parameters.
-
-
-        self.parameters = ["teff", "logg", "[M/H]", "[alpha/M]", "xi"]
+        self.parameters = [] + self.model_atmospheres.parameters
         return None
 
 
-    def optimise_sp(self, p0=None, elements=("Fe", ), measure=True, line_outliers=True, moog_kwargs=None, **kwargs):
+    def optimise_equilibria(self, p0=None, method="classical"):
         """
-        Calculate equivalent widths for all transitions in all channels, then optimise the stellar
-        parameters.
+        Perform an excitation and ionisation balance from an initial guess point.
         """
 
-        if p0 is None:
+        # [TODO] Get a joint initial esimate based on expected Teff, logg, [M/H] distributions,
+        # and known relationships between xi and these parameters.
 
-            initial_pos = np.array([
-                np.random.uniform(3000, 8000),
-                1,
-                np.random.uniform(0, 5),
-                np.random.uniform(-5, 1)
-                ])
-
-            #p0 = [4500, 1.0, 2.0, -1]
-        else:
-            initial_pos = p0
-        if moog_kwargs is None:
-            moog_kwargs = {}
-
-        # Get the list of neutral and ionized species for stellar parameter optimisation.
-        species = map(utils.element_to_species, elements)
-        species += [0.1 + each for each in species]
-
-        if measure:
-            # Measure equivalent widths in all channels.
-            balance_transitions = []
-            for i, channel in enumerate(self.channels):
-                if "plot_filename" in kwargs:
-                    channel_kwargs = kwargs.copy()
-                    channel_kwargs["plot_filename"] = channel_kwargs["plot_filename"].format(i)
-                else:
-                    channel_kwargs = kwargs.copy()
-                xopt, fopt, model_flux = channel.optimise(**channel_kwargs)
-
-                # Identify all the species we need.
-                species_indices = np.zeros(len(channel.transitions), dtype=bool)
-                for each in species:
-                    species_indices += (channel.transitions["species"] == each)
-                balance_transitions.append(channel.transitions[species_indices])
-
-            # Use the table of measured equivalent widths to optimise stellar parameters.
-            balance_transitions = nprcf.stack_arrays(balance_transitions, usemask=False)
-
-        else:
-            balance_transitions = []
-            species_indices = np.zeros(len(self.transitions), dtype=bool)
-            for each in species:
-                species_indices += (self.transitions["species"] == each)
-            balance_transitions = self.transitions[species_indices]
-
-        # We'll need an instance of MOOG for this.
-        with moog.instance("/tmp", debug=True) as moogsilent:
-
-            # Write transitions and equivalent widths to file.
-            ew_filename = os.path.join(moogsilent.twd, "ews")
-            with open(ew_filename, "w+") as fp:
-                fp.write(moogsilent._format_ew_input(balance_transitions, **moog_kwargs))
-            
-
-            fill_value = 1.
-            def minimise(theta):
-
-                # Parse theta
-                teff, xi, logg, m_h= theta[:4]
-                alpha_m = 0.
-
-                if 0 > xi: return np.array([fill_value] * len(theta))
-
-                # Check to see if we have already executed MOOG for these parameters given some
-                # tolerance, so that we can avoid unnecessary calls to MOOG.
-
-                # Interpolate a stellar atmosphere and write it to file.
-                atmosphere_filename = os.path.join(moogsilent.twd, "model")
-                try:
-                    thermal_structure = self.model_atmospheres.interpolate_thermal_structure(
-                        teff, logg, m_h, alpha_m)
-                except:
-                    return np.array([fill_value] * len(theta))
-
-                self.model_atmospheres.parser.write_atmosphere(atmosphere_filename,
-                    teff, logg, m_h, xi, thermal_structure, clobber=True)
-
-                # Convert equivalent widths to abundances.
-                results = moogsilent.abfind(atmosphere_filename, ew_filename, **moog_kwargs)
-
-                # Calculate trend lines, allowing for outliers where appropriate.
-                # Trend lines in:
-                # - reduced equivalent width vs abundance
-                # - excitation potential vs abundance
-                # - input model atmosphere - mean Fe abundance
-                # - mean Fe abundance - mean Fe II abundance
-                excitation_balance = line.Line(x=results["excitation_potential"], y=results["abundance"],
-                    yerr=np.array([0.05] * len(results)), outliers=line_outliers).optimise()
-
-                turbulence_balance = line.Line(x=np.log(results["equivalent_width"]/results["wavelength"]),
-                    y=results["abundance"], yerr=np.array([0.05] * len(results)), outliers=line_outliers)\
-                    .optimise()
-
-                # Find neutral and ionised species.
-                int_species = np.array(map(int, results["species"]))
-                ionised = results["species"] % int_species > 0
-                neutral = ~ionised
-                # Match by species. 
-                ionisation_balance = 0
-                for specie in set(map(int, species)):
-                    neutral_species = (int_species == specie) * neutral
-                    ionised_species = (int_species == specie) * ionised
-                    ionisation_balance += (np.median(results[neutral_species]["abundance"]) \
-                        - np.median(results[ionised_species]["abundance"]))/10.
-
-                metallicity_balance = np.median((results[(results["species"] == species[0])]["abundance"] \
-                    - (m_h + solar_abundances[int(species[0])]))/10.) # TODO
-
-                components = np.array([excitation_balance[0], turbulence_balance[0], ionisation_balance,
-                    metallicity_balance])**2
-
-                print(theta, np.sum(components))
-                return components
-
-            def minimise_scalar(theta):
-                return np.sum(minimise(theta))
-                
-            # Do an initial optimisation with fsolve, then one with fmin from the best point?
-            vector_opt = op.fsolve(minimise, p0, fprime=utils.sp_jacobian, col_deriv=1, epsfcn=0,
-                xtol=1e-10, full_output=1, maxfev=100)
-
-            scalar_opt = op.fmin(minimise_scalar, vector_opt[0])
-            raise a
-        return result
-
-
-    def infer_sp_from_ew(self, p0, walkers=50, burn=900, sample=100):
-        
-        p0 = [4000, 1.06, 1.0, -1]
-        #p0 = [np.random.uniform(*boundaries) for boundaries in self.model_atmospheres.boundaries]
-         
         p0 = np.array([
             np.random.uniform(3000, 8000),
             np.random.uniform(0, 3),
             np.random.uniform(0, 5),
             np.random.uniform(-5, 1)
         ])
+        
+        # Initiate a MOOG instance.
+        with moog.instance("/tmp") as moogsilent:
 
-   
-        #teff, xi, logg, m_h
-        with moog.instance(debug=True) as moogsilent:
-
+            # Write equivalent widths to file as these won't change during optimisation.
             with open("ews", "w+") as fp:
-                fp.write(moogsilent._format_ew_input(self.transitions[self.transitions["species"].astype(int) == 26]))
+                fp.write(moogsilent._format_ew_input(
+                    self.transitions[self.transitions["species"].astype(int) == 26]))
 
-            #scalar_opt = lambda theta: ln_likelihood(theta, self.model_atmospheres, "ews", moogsilent)
-            newton = op.fsolve(ln_likelihood, p0, args=(self.model_atmospheres, "ews", moogsilent), fprime=utils.sp_jacobian,
-                    col_deriv=1, epsfcn=0, xtol=1e-10, full_output=1)
+            # This is a dirty hack to give fsolve some positive reinforcement.
+            _iteration = [0.]
+            def wrap_excitation_ionisation_equilibria(theta):
+                result = excitation_ionisation_equilibria(theta, self.model_atmospheres, "ews", moogsilent)
+                _iteration[0] += 1.
+                return result/_iteration[0]
 
-            raise a
-            p0 = op.fmin(scalar_opt, p0)
+            # The global solver makes use of an empirical Jacobian approximation to quickly move through the
+            # parameter space.
+            global_solver = op.fsolve(wrap_excitation_ionisation_equilibria, p0, fprime=utils.sp_jacobian,
+                col_deriv=1, epsfcn=0, xtol=1e-5, full_output=1)
 
-            ndim = len(p0)
-            sampler = emcee.EnsembleSampler(walkers, ndim, ln_likelihood,
-                args=(self.model_atmospheres, "ews", moogsilent), threads=24)
+            # Once the solution is near, the Jacobian is providing too much (false) information to the system,
+            # so we perform a scalar optimisation with the squared sum of all components.
+            scalar_func = lambda theta: sum(excitation_ionisation_equilibria(theta, self.model_atmospheres, \
+                "ews", moogsilent)**2)
+            scalar_solver = op.fmin(scalar_func, global_solver[0], xtol=1e-2, ftol=4e-6, full_output=True)
 
-            mean_acceptance_fractions = np.zeros(burn + sample)
-            initial_pos = np.array([p0 + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
-            for i, (pos, lnprob, rstate) in enumerate(sampler.sample(initial_pos, iterations=burn)):
-                mean_acceptance_fractions[i] = np.mean(sampler.acceptance_fraction)
-                logger.info(u"Sampler has finished step {0:.0f} with <a_f> = {1:.3f}, maximum log probability"\
-                    " in last step was {2:.3e}".format(i + 1, mean_acceptance_fractions[i],
-                        np.max(sampler.lnprobability[:, i])))
+        return scalar_solver
 
-                if mean_acceptance_fractions[i] in (0, 1):
-                    raise RuntimeError("mean acceptance fraction is {0:.0f}!".format(mean_acceptance_fractions[i]))
 
-            # Reset the chains and sample.
-            logger.info("Resetting chain...")
-            chain, lnprobability = sampler.chain, sampler.lnprobability
-            sampler.reset()
 
-            logger.info("Sampling posterior...")
-            for j, state in enumerate(sampler.sample(pos, iterations=sample)):
-                mean_acceptance_fractions[i + j + 1] = np.mean(sampler.acceptance_fraction)
-
-            raise a
+            
 
 """
 Infer the parameters of the model, given the data.
@@ -337,6 +231,33 @@ Use masks around each line to identify which pixels to use in the comparison. Th
 yield us posterior probability distributions in all parameters given the data. I admit,
 the problem description looks daunting, but I can't think of any other way to get the
 correct PDFs.
+
+p_opt = scalar_solver[0]
+ndim = len(p_opt)
+sampler = emcee.EnsembleSampler(walkers, ndim, ln_likelihood,
+    args=(self.model_atmospheres, "ews", moogsilent), threads=threads)
+
+mean_acceptance_fractions = np.zeros(burn + sample)
+initial_pos = np.array([p_opt + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
+for i, (pos, lnprob, rstate) in enumerate(sampler.sample(initial_pos, iterations=burn)):
+    mean_acceptance_fractions[i] = np.mean(sampler.acceptance_fraction)
+    logger.info(u"Sampler has finished step {0:.0f} with <a_f> = {1:.3f}, maximum log probability"\
+        " in last step was {2:.3e}".format(i + 1, mean_acceptance_fractions[i],
+            np.max(sampler.lnprobability[:, i])))
+
+    if mean_acceptance_fractions[i] in (0, 1):
+        raise RuntimeError("mean acceptance fraction is {0:.0f}!".format(mean_acceptance_fractions[i]))
+
+# Reset the chains and sample.
+logger.info("Resetting chain...")
+chain, lnprobability = sampler.chain, sampler.lnprobability
+sampler.reset()
+
+logger.info("Sampling posterior...")
+for j, state in enumerate(sampler.sample(pos, iterations=sample)):
+    mean_acceptance_fractions[i + j + 1] = np.mean(sampler.acceptance_fraction)
+
+raise a
 """
 
 
@@ -389,7 +310,7 @@ indices = (5875. > transitions["rest_wavelength"]) * (transitions["rest_waveleng
 blue = SpectralChannel(blue_channel, transitions[indices], wl_tolerance=0.1)
 #result = blue.optimise(verbose=True)
 
-star = Star("MARCS (2011)", transitions, [blue_channel, green_channel, red_channel, ir_channel], wl_tolerance=0.1)
+#star = Star("MARCS (2011)", transitions, [blue_channel, green_channel, red_channel, ir_channel], wl_tolerance=0.1)
 
 # Now we have equivalent widths. Use them to optimise stellar parameters.
 
@@ -408,6 +329,9 @@ Star(spectral_data, atmospheres, transitions)
 
 with open("yong-2012-ngc6752-table2-mg1.pkl", "rb") as fp:
     transitions = pickle.load(fp)
-yong_star = Star("Castelli & Kurucz (2003)", transitions, [], wl_tolerance=0.1)
+#yong_star = Star("Castelli & Kurucz (2003)", transitions, [], wl_tolerance=0.1)
+#yong_star = Star("atmospheres/castelli-kurucz/a???at*.dat", transitions, [], wl_tolerance=0.1)
+yong_star = Star("atmospheres/castelli-kurucz/a???at*.dat", transitions, [], wl_tolerance=0.1)
+
 #yong_star.infer_sp_from_ew(None)
 
