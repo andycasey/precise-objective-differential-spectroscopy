@@ -37,6 +37,8 @@ class Line(object):
         p0 = [slope, intercept]
         if self.outliers:
             p0.extend([0.5, np.median(self.y), np.std(self.y)])
+            if self.yerr is None:
+                self.yerr = np.ones(len(self.y))
 
         elif self.yerr is None:
             # No errors, no outliers.
