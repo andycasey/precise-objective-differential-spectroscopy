@@ -157,7 +157,7 @@ class Star(object):
             previous_order_max_disp = max_disp
 
         # Create the atmosphere interpolator.
-        self.model_atmospheres = atmosphere.Interpolator(model_atmosphere_wildmask)
+        self.model_atmospheres = atmospheres.Interpolator(model_atmosphere_wildmask)
 
         # Create a list of parameters.
         self.parameters = [] + self.model_atmospheres.parameters
@@ -180,7 +180,7 @@ class Star(object):
         ])
         
         # Initiate a MOOG instance.
-        with moog.instance("/tmp") as moogsilent:
+        with moog.instance("/tmp",debug=True) as moogsilent:
 
             # Write equivalent widths to file as these won't change during optimisation.
             with open("ews", "w+") as fp:
@@ -260,78 +260,79 @@ for j, state in enumerate(sampler.sample(pos, iterations=sample)):
 raise a
 """
 
-
-class spectrum(object):
-    pass
-
-
-data = np.loadtxt("spectra/uvessun1.txt", skiprows=1)
-
-blue_channel = spectrum()
-blue_channel.dispersion = data[:,0]
-blue_channel.flux = data[:, 1]
-blue_channel.variance =  np.array([0.001] * len(blue_channel.dispersion))
-blue_channel.inv_var = 1.0/blue_channel.variance
+if __name__ == "__main__":
+        
+    class spectrum(object):
+        pass
 
 
-data = np.loadtxt("spectra/uvessun2.txt", skiprows=1)
+    data = np.loadtxt("spectra/uvessun1.txt", skiprows=1)
 
-green_channel = spectrum()
-green_channel.dispersion = data[:,0]
-green_channel.flux = data[:, 1]
-green_channel.variance =  np.array([0.001] * len(green_channel.dispersion))
-green_channel.inv_var = 1.0/green_channel.variance
-
-data = np.loadtxt("spectra/uvessun3.txt", skiprows=1)
-
-red_channel = spectrum()
-red_channel.dispersion = data[:,0]
-red_channel.flux = data[:, 1]
-red_channel.variance =  np.array([0.001] * len(red_channel.dispersion))
-red_channel.inv_var = 1.0/red_channel.variance
-
-data = np.loadtxt("spectra/uvessun4.txt", skiprows=1)
-
-ir_channel = spectrum()
-ir_channel.dispersion = data[:,0]
-ir_channel.flux = data[:, 1]
-ir_channel.variance =  np.array([0.001] * len(ir_channel.dispersion))
-ir_channel.inv_var = 1.0/ir_channel.variance
-
-#sun = Star([blue_channel], "marcs-sun.model")#, line_lists)
-#sun.optimise_channel(blue_channel, "marcs-sun.model", transitions)
-
-with open("transitions.pkl", "rb") as fp:
-    transitions = pickle.load(fp)
-
-# Get just blue channel ones
-indices = (5875. > transitions["rest_wavelength"]) * (transitions["rest_wavelength"] > 5645.)
-
-blue = SpectralChannel(blue_channel, transitions[indices], wl_tolerance=0.1)
-#result = blue.optimise(verbose=True)
-
-#star = Star("MARCS (2011)", transitions, [blue_channel, green_channel, red_channel, ir_channel], wl_tolerance=0.1)
-
-# Now we have equivalent widths. Use them to optimise stellar parameters.
-
-"""
-Star(spectral_data, atmospheres, transitions)
-.channels
-
-(1) Split up transitions to each channel. Warn if same transition goes to multiple channels, or if there is overlap between channels.
-
-(2) star.optimise(p0)
-    Measures EWs in each channel, calculates line trends and optimises them.
-
-(3) star.infer(p0)
-"""
+    blue_channel = spectrum()
+    blue_channel.dispersion = data[:,0]
+    blue_channel.flux = data[:, 1]
+    blue_channel.variance =  np.array([0.001] * len(blue_channel.dispersion))
+    blue_channel.inv_var = 1.0/blue_channel.variance
 
 
-with open("yong-2012-ngc6752-table2-mg1.pkl", "rb") as fp:
-    transitions = pickle.load(fp)
-#yong_star = Star("Castelli & Kurucz (2003)", transitions, [], wl_tolerance=0.1)
-#yong_star = Star("atmospheres/castelli-kurucz/a???at*.dat", transitions, [], wl_tolerance=0.1)
-yong_star = Star("atmospheres/castelli-kurucz/a???at*.dat", transitions, [], wl_tolerance=0.1)
+    data = np.loadtxt("spectra/uvessun2.txt", skiprows=1)
 
-#yong_star.infer_sp_from_ew(None)
+    green_channel = spectrum()
+    green_channel.dispersion = data[:,0]
+    green_channel.flux = data[:, 1]
+    green_channel.variance =  np.array([0.001] * len(green_channel.dispersion))
+    green_channel.inv_var = 1.0/green_channel.variance
+
+    data = np.loadtxt("spectra/uvessun3.txt", skiprows=1)
+
+    red_channel = spectrum()
+    red_channel.dispersion = data[:,0]
+    red_channel.flux = data[:, 1]
+    red_channel.variance =  np.array([0.001] * len(red_channel.dispersion))
+    red_channel.inv_var = 1.0/red_channel.variance
+
+    data = np.loadtxt("spectra/uvessun4.txt", skiprows=1)
+
+    ir_channel = spectrum()
+    ir_channel.dispersion = data[:,0]
+    ir_channel.flux = data[:, 1]
+    ir_channel.variance =  np.array([0.001] * len(ir_channel.dispersion))
+    ir_channel.inv_var = 1.0/ir_channel.variance
+
+    #sun = Star([blue_channel], "marcs-sun.model")#, line_lists)
+    #sun.optimise_channel(blue_channel, "marcs-sun.model", transitions)
+
+    with open("transitions.pkl", "rb") as fp:
+        transitions = pickle.load(fp)
+
+    # Get just blue channel ones
+    indices = (5875. > transitions["rest_wavelength"]) * (transitions["rest_wavelength"] > 5645.)
+
+    blue = SpectralChannel(blue_channel, transitions[indices], wl_tolerance=0.1)
+    #result = blue.optimise(verbose=True)
+
+    #star = Star("MARCS (2011)", transitions, [blue_channel, green_channel, red_channel, ir_channel], wl_tolerance=0.1)
+
+    # Now we have equivalent widths. Use them to optimise stellar parameters.
+
+    """
+    Star(spectral_data, atmospheres, transitions)
+    .channels
+
+    (1) Split up transitions to each channel. Warn if same transition goes to multiple channels, or if there is overlap between channels.
+
+    (2) star.optimise(p0)
+        Measures EWs in each channel, calculates line trends and optimises them.
+
+    (3) star.infer(p0)
+    """
+
+
+    with open("yong-2012-ngc6752-table2-mg1.pkl", "rb") as fp:
+        transitions = pickle.load(fp)
+    #yong_star = Star("Castelli & Kurucz (2003)", transitions, [], wl_tolerance=0.1)
+    #yong_star = Star("atmospheres/castelli-kurucz/a???at*.dat", transitions, [], wl_tolerance=0.1)
+    yong_star = Star("/Users/arc/atmospheres/castelli-kurucz-2004/a???at*.dat", transitions, [], wl_tolerance=0.1)
+
+    #yong_star.infer_sp_from_ew(None)
 
