@@ -13,6 +13,9 @@ import numpy as np
 __all__ = ["CastelliKuruczAlphaParser"]
 
 class CastelliKuruczAlphaParser(object):
+    """
+    A class to parse Castelli & Kurucz alpha-enhanced (ODFNEW) model atmospheres.
+    """
 
     ntau = 72
     parameters = ["teff", "logg", "feh"]
