@@ -117,6 +117,8 @@ def channel_ln_probability(theta, dispersion, flux, variance, parameters, transi
 
 class SpectralChannel(object):
 
+    upper_smoothing_sigma = 0.5
+
     def __init__(self, data, transitions, mask=None, redshift=False, continuum_order=-1,
         outliers=False, wl_tolerance=0, wl_cont=1):
 
@@ -173,42 +175,31 @@ class SpectralChannel(object):
 
 
 
-    def _fit(self, theta, full_output=False, verbose=True):
+    def _fit(self, theta, full_output=False, verbose=True, fail_value=9e99):
+
+        theta_dict = dict(zip(self.parameters, theta))
+        if self.outliers:
+            Po, Yo, Vo = [theta_dict[each] for each in ("Po", "Yo", "Vo")]
+            if not (1 > Po > 0) or 0 > Vo:
+                return fail_value
 
         # Create continuum shape.
+        continuum = np.ones(len(self.data))
         if self.continuum_order > -1:
             continuum_coefficients = [theta[self.parameters.index("c_{0}".format(i))] \
                 for i in range(self.continuum_order + 1)]
-            continuum = np.polyval(continuum_coefficients, self.dispersion)
+            continuum *= np.polyval(continuum_coefficients, self.dispersion)
         
-        else:
-            continuum = np.ones(len(self.data))
-        
-        if self.outliers:
-            Po, Yo, Vo = [theta[self.parameters.index(each)] for each in ("Po", "Yo", "Vo")]
-            if not (1 > Po > 0) or 0 > Vo:
-                return np.inf
-
-        
-
         # Add absorption lines.
         for i, transition in enumerate(self.transitions):
-            if self.wl_tolerance > 0:
-                wavelength = theta[self.parameters.index("wl_{0}".format(i))]
-
-            else:
-                wavelength = transition["rest_wavelength"]
-
-            #sigma = theta[0] * (wavelength/self.dispersion[0])
-            sigma = theta[self.parameters.index("sigma_{0}".format(i))]
-            depth = theta[self.parameters.index("ld_{0}".format(i))]
-            if not (1 >= depth >= 0) or 0 > sigma \
+            wavelength = theta_dict["wl_{0}".format(i)] if self.wl_tolerance > 0 else transition["rest_wavelength"]
+            depth, sigma = theta_dict["ld_{0}".format(i)], theta_dict["sigma_{0}".format(i)]
+            if not (1 >= depth >= 0) or not (self.upper_smoothing_sigma > sigma > 0) \
             or abs(wavelength - transition["rest_wavelength"]) > self.wl_tolerance:
-                return np.inf
+                return fail_value
 
             z = args[0] if self.redshift else 0
             wavelength *= (1. + z)
-
             if self.wl_cont > 0:
                 indices = self.dispersion.searchsorted([
                     wavelength - self.wl_cont,
@@ -216,7 +207,6 @@ class SpectralChannel(object):
                 ])
                 x = self.dispersion.__getslice__(*indices)
                 y = continuum.__getslice__(*indices)
-
                 continuum.__setslice__(indices[0], indices[1],
                     y * _absorption_line_(wavelength, depth, sigma, x)
                 )
@@ -225,7 +215,6 @@ class SpectralChannel(object):
                 continuum *= _absorption_line_(wavelength, depth, sigma, self.dispersion)
 
         ivar = 1.0/self.variance
-        #continuum[continuum == 1.] = np.nan
         chi_sq = (continuum - self.data)**2 * ivar
         
         if self.outliers:
@@ -237,7 +226,7 @@ class SpectralChannel(object):
 
             # Make this the negative log-likelihood, since this function will only be used in optimisation.
             ln_like = np.logaddexp(np.log(1-Po) + signal_ln_like, np.log(Po) + outlier_ln_like)
-            finite = np.isfinite(ln_like)
+            finite = np.isfinite(ln_like) * np.isfinite(self.mask)
             ln_like = -np.sum(ln_like[finite])
 
             print(ln_like)
@@ -248,10 +237,8 @@ class SpectralChannel(object):
                 return (ln_like, continuum)
             return ln_like
 
-        chi_sq *= self.mask
         # No outlier modelling; just return chi-sq.
-        finite = np.isfinite(chi_sq)
-        chi_sq = np.sum(chi_sq[finite])
+        chi_sq = np.sum(chi_sq[np.isfinite(self.mask)])
         print(chi_sq)
         if verbose:
             print(chi_sq)
@@ -260,7 +247,7 @@ class SpectralChannel(object):
         return chi_sq
 
 
-    def optimise(self, force=False, verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
+    def optimise(self, max_iterations=3, initial_clip_iter=5, initial_clip_limits=(0.2, 3.0), verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
         plot_clobber=False):
         # Optimise the channel and line parameters.
 
@@ -274,7 +261,7 @@ class SpectralChannel(object):
         if channel_kwargs is not None:
             op_channel_kwargs.update(channel_kwargs)
         
-        # Let's do a first pass for each line, then we'll iterate on the channel globally.
+        # We might not have all these parameters, but we can set some defaults.
         default_p0 = {
             "z": 0,
             "smoothing_sigma": 0.05,
@@ -283,19 +270,35 @@ class SpectralChannel(object):
             "Vo": np.std(self.data[self._finite])**2
         }
 
-        # Wavelengths
+        # Wavelengths.
         default_p0.update(dict(zip(
             ["wl_{0}".format(i) for i in range(len(self.transitions))],
             [each["rest_wavelength"] for each in self.transitions]
         )))
         default_p0.update(dict(zip(
             ["sigma_{0}".format(i) for i in range(len(self.transitions))],
-            [0.05] * len(self.transitions)
+            [default_p0["smoothing_sigma"]] * len(self.transitions)
         )))
 
-        # Continuum coefficients
+        # Continuum coefficients.
         if self.continuum_order >= 0:
+            continuum_mask = np.isfinite(self.mask)
             continuum_coefficients = np.polyfit(self.dispersion, self.data, self.continuum_order)
+            
+            # Perform some crude sigma-clipping because we expect absorption features.
+            if self.continuum_order > -1:
+                lower_clip, upper_clip = initial_clip_limits
+                for i in xrange(initial_clip_iter):
+
+                    difference = np.polyval(continuum_coefficients, self.dispersion) - self.data
+                    sigma = np.std(difference)
+                    exclude = (difference > lower_clip * sigma) + (difference < -upper_clip*sigma)
+
+                    # Remove the excluded points.
+                    continuum_coefficients = np.polyfit(self.dispersion[~exclude], self.data[~exclude],
+                        self.continuum_order)
+
+            # Save the continuum coefficients.
             default_p0.update(dict(zip(
                 ["c_{0}".format(i) for i in range(self.continuum_order + 1)],
                 continuum_coefficients
@@ -305,103 +308,143 @@ class SpectralChannel(object):
         if self.continuum_order > -1:
             continuum_shape *= np.polyval(continuum_coefficients, self.dispersion)
 
-            # Perform some crudimentary sigma-clipping just
+        # We will iterate between the global and local line fitting.
+        for i in xrange(max_iterations):
 
-        xopts = []
-        # Fit each line using the continuum we've set.
-        for i, transition in enumerate(self.transitions):
+            xopts = []
+            # Fit each line using the continuum we've set.
+            for j, transition in enumerate(self.transitions):
 
-            def fit_absorption_line(args, continuum, full_output):
-                
-                continuum = continuum.copy()
+                def fit_absorption_line(args, continuum, full_output, fail_value=np.inf):
+                    
+                    model = continuum.copy()
 
+                    if self.wl_tolerance > 0:
+                        depth, sigma, wavelength = args
+
+                    else:
+                        depth, sigma = args
+                        wavelength = transition["rest_wavelength"]
+
+                    if not (1 > depth > 0) \
+                    or not (self.upper_smoothing_sigma > sigma > 0) \
+                    or abs(wavelength - transition["rest_wavelength"]) > (self.wl_tolerance - 1e-3):
+                        return fail_value
+
+                    z = args[0] if self.redshift else 0
+                    wavelength *= (1. + z)
+                    
+                    if self.wl_cont > 0:
+                        indices = self.dispersion.searchsorted([
+                            wavelength - self.wl_cont,
+                            wavelength + self.wl_cont
+                        ])
+                        x = self.dispersion.__getslice__(*indices)
+                        y = model.__getslice__(*indices)
+
+                        model.__setslice__(indices[0], indices[1],
+                            y * _absorption_line_(wavelength, depth, sigma, x)
+                        )
+
+                    else:
+                        model *= _absorption_line_(wavelength, depth, sigma, self.dispersion)
+
+                    chi_sqi = (model - self.data)**2/self.variance
+                    chi_sq = chi_sqi[np.isfinite(chi_sqi * self.mask)].sum()
+                    if full_output:
+                        return (chi_sq, model)
+                    return chi_sq
+
+                if i == 0:
+                    index = self.dispersion.searchsorted(transition["rest_wavelength"])
+
+                    line_p0 = [1. - self.data[index]/continuum_shape[index], default_p0["sigma_{0}".format(j)]]
+                    if self.wl_tolerance > 0:
+                        line_p0.append(transition["rest_wavelength"])
+                else:
+                    line_p0 = np.array([default_p0["ld_{0}".format(j)], default_p0["sigma_{0}".format(j)], default_p0["wl_{0}".format(j)]])
+
+                index = self.dispersion.searchsorted(transition["rest_wavelength"])
+                line_p0 = np.array([1. - self.data[index]/continuum_shape[index], default_p0["smoothing_sigma"], transition["rest_wavelength"]])
+
+                xopt, fopt, niter, nfuncs, warnflag = op.fmin(fit_absorption_line, line_p0,
+                    args=(continuum_shape, False), **op_line_kwargs)
+                xopts.append(xopt)
+                if warnflag > 0:
+                    message = [
+                        "Che problem?",
+                        "Maximum number of function evaluations made",
+                        "Maximum number of iterations made"
+                    ]
+                    logging.warn("{0} for transition at {1}".format(message[warnflag], transition["rest_wavelength"])) 
+
+                # Update the default_p0 values.
+                default_p0["ld_{0}".format(j)] = np.clip(xopt[0], 0, 1)
+                default_p0["sigma_{0}".format(j)] = xopt[1]
                 if self.wl_tolerance > 0:
-                    depth, sigma, wavelength = args
+                    default_p0["wl_{0}".format(j)] = xopt[2]
 
-                else:
-                    depth, sigma = args
-                    wavelength = transition["rest_wavelength"]
+            # Optimise the parameters globally if required.
+            # Note: the smoothing kernel is always a global parameter, but the median of the line sigmas
+            #       is a sufficient approximation. So here we are just checking for either redshift or
+            #       continuum coefficients.
+            channel_p0 = np.array([default_p0[parameter] for parameter in self.parameters])
 
-                if not (1 > depth > 0) or 0 > sigma or abs(wavelength - transition["rest_wavelength"]) > (self.wl_tolerance - 1e-3):
-                    return np.inf
+            if i == 0:
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots()
+                ax.plot(self.dispersion, self._fit(channel_p0, True, False)[1], 'r')
+                ax.plot(self.dispersion, self.data, 'k')
+                plt.savefig("moo.pdf")
 
-                z = args[0] if self.redshift else 0
-                wavelength *= (1. + z)
-                sigma *= (wavelength/self.dispersion[0])
+            if self.continuum_order > -1 or "z" in self.parameters or force:
+                print("doing it")
 
-                if self.wl_cont > 0:
-                    indices = self.dispersion.searchsorted([
-                        wavelength - self.wl_cont,
-                        wavelength + self.wl_cont
-                    ])
-                    x = self.dispersion.__getslice__(*indices)
-                    y = continuum.__getslice__(*indices)
+                bounds = []
+                for k, parameter in enumerate(self.parameters):
+                    if parameter.startswith("wl_"):
+                        index = int(parameter.split("_")[1])
+                        bounds.append([
+                            self.transitions[index]["rest_wavelength"] - self.wl_tolerance,
+                            self.transitions[index]["rest_wavelength"] + self.wl_tolerance
+                        ])
 
-                    continuum.__setslice__(indices[0], indices[1],
-                        y * _absorption_line_(wavelength, depth, sigma, x)
-                    )
+                    elif parameter.startswith("sigma_"):
+                        bounds.append([0., self.upper_smoothing_sigma])
 
-                else:
-                    continuum *= _absorption_line_(wavelength, depth, sigma, self.dispersion)
+                    elif parameter.startswith("ld_") or parameter == "Po":
+                        bounds.append([0., 1.])
 
-                chi_sq = np.sum((continuum - self.data)**2/self.variance)
-                if full_output:
-                    return (chi_sq, continuum)
-                return chi_sq
+                    elif parameter == "Vo":
+                        bounds.append([0, None])
 
-            index = self.dispersion.searchsorted(transition["rest_wavelength"])
+                    elif parameter == "Yo":
+                        bounds.append([0, None])
 
-            line_p0 = [1. - self.data[index]/continuum_shape[index], default_p0["smoothing_sigma"]]
-            if self.wl_tolerance > 0:
-                line_p0.append(transition["rest_wavelength"])
+                    else:
+                        bounds.append((None, None))
 
-            #xopt, fopt, niter, nfuncs, warnflag = op.fmin(fit_absorption_line, line_p0, args=(continuum_shape, False),
-            #    **op_line_kwargs)
-            warnflag, xopt = 0, line_p0
-            xopts.append(xopt)
-            if warnflag > 0:
-                message = [
-                    "Che problem?",
-                    "Maximum number of function evaluations made",
-                    "Maximum number of iterations made"
-                ]
-                logging.warn("{0} for transition at {1}".format(message[warnflag], transition["rest_wavelength"])) 
 
-            # Update the default_p0 values.
-            if self.wl_tolerance > 0:
-                default_p0["wl_{0}".format(i)] = xopt[2]
-            default_p0["ld_{0}".format(i)] = np.clip(xopt[0], 0, 1)
+                #xopt, fopt, info = op.fmin_l_bfgs_b(self._fit, channel_p0,
+                #    args=(False, verbose), m=100, pgtol=1e-32, approx_grad=True, bounds=bounds)
+                xopt, fopt, iterations, funcalls, warnflag = op.fmin(self._fit, channel_p0,
+                    args=(False, verbose), **op_channel_kwargs)
+                
+                if warnflag > 0:
+                    message = [
+                        "Che problem?",
+                        "Maximum number of function evaluations made",
+                        "Maximum number of iterations made"
+                    ]
+                    logging.warn("{0} for channel fit. Optimised values may be (even more) inaccurate.".format(
+                        message[warnflag]))
 
-        default_p0["smoothing_sigma"] = abs(np.median([xopt[1] for xopt in xopts]))
-        
-        # Optimise the parameters globally if required.
-        # Note: the smoothing kernel is always a global parameter, but the median of the line sigmas
-        #       is a sufficient approximation. So here we are just checking for either redshift or
-        #       continuum coefficients.
-        channel_p0 = np.array([default_p0[parameter] for parameter in self.parameters])
+            else:
+                xopt = channel_p0
 
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots()
-        ax.plot(self.dispersion, self._fit(channel_p0, True, False)[1], 'r')
-        ax.plot(self.dispersion, self.data, 'k')
-        plt.savefig("moo.pdf")
 
-        if self.continuum_order > -1 or "z" in self.parameters or force:
-            print("doing it")
-            xopt, fopt, niter, nfuncs, warnflag = op.fmin(self._fit, channel_p0, args=(False, verbose),
-                **op_channel_kwargs)
-            if warnflag > 0:
-                message = [
-                    "Che problem?",
-                    "Maximum number of function evaluations made",
-                    "Maximum number of iterations made"
-                ]
-                logging.warn("{0} for channel fit. Optimised values may be (even more) inaccurate.".format(
-                    message[warnflag]))
-
-        else:
-            xopt = channel_p0
-
+            # Update the default_p0 values with our optimised values for the next iteration.
+            default_p0.update(dict(zip(self.parameters, xopt)))
 
         """
         fig, ax = plt.subplots()
@@ -434,8 +477,8 @@ class SpectralChannel(object):
             ax.plot(self.dispersion, model, 'b')
             ax.set_xlim(self.dispersion[0], self.dispersion[-1])
             fig.savefig(plot_filename, clobber=plot_clobber)
-            plt.close(fig)
 
+        raise a
         # Infer dat shit.
         walkers = 200
         ndim = len(self.parameters)
@@ -532,6 +575,8 @@ if __name__ == "__main__":
     blue = SpectralChannel(blue_channel, transitions[indices], wl_tolerance=0.10, continuum_order=-1, outliers=True)
 
     p0 = blue.optimise()
+
+    raise a
 
     posterior, sampler, info = blue.infer(p0[0], 400, 400, 100, 8)
 

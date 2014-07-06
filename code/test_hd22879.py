@@ -47,7 +47,7 @@ use_regions = np.array([
     [4869.85, 4870.3],
     [4873.88, 4874.19],
     [4884.95, 4885.25],
-#    [4889.9, 4892.67],
+    [4889.9, 4892.67],
     [4894.7, 4895.0]
 ])
 
@@ -64,7 +64,8 @@ for row in use_regions:
 
 print(np.sum(np.isfinite(mask)))
 
-blue = SpectralChannel(blue_channel, transitions[transition_indices], mask=mask, redshift=False, continuum_order=3, wl_tolerance=0.1, wl_cont=2, outliers=True)
+blue = SpectralChannel(blue_channel, transitions[transition_indices], mask=mask, redshift=False, continuum_order=3,
+    wl_tolerance=0.10, wl_cont=2, outliers=True)
 
 
 
