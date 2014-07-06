@@ -6,16 +6,26 @@ from __future__ import division, print_function
 
 __author__ = "Andy Casey <andy@astrowizici.st>"
 __all__ = ["element_to_species", "species_to_element", "get_common_letters", \
-    "find_common_start", "extend_limits", "sp_jacobian"]
+    "find_common_start", "extend_limits", "sp_jacobian", "unused_filename"]
+
+import os
+from random import choice
+from string import ascii_letters
 
 # Third party imports
 import numpy as np
 
 
+def unused_filename(dirname="", length=5):
+
+    filename = "".join(dirname, [choice(ascii_letters) for _ in xrange(length)])
+    while os.path.exists(filename):
+        filename = "".join(dirname, [choice(ascii_letters) for _ in xrange(length)])
+    return filename
+
 def sp_jacobian(stellar_parameters, *args):
     """ Approximate the Jacobian of the stellar parameters and
     minimisation parameters, based on calculations from the Sun """
-
 
     print("-----------------")
     print("UPDATING JACOBIAN")
