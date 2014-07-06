@@ -25,7 +25,7 @@ import numpy as np
 import utils
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class MOOGError(BaseException):
     pass
@@ -374,9 +374,8 @@ class instance(object):
         num_spectra = len(kwargs["abundances"].values()[0]) if kwargs.get("abundances", None) is not None else 1
         spectrum = self._parse_synth_standard_output(standard_out, num_spectra)
 
-        if not parallel:
-            # Remove in/out files
-            map(os.remove, [input_filename, standard_out, summary_out])
+        # Remove in/out files
+        map(os.remove, [input_filename, standard_out, summary_out])
 
         return spectrum
 
