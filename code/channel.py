@@ -12,6 +12,8 @@ import numpy as np
 import numpy.lib.recfunctions as nprcf
 from scipy import optimize as op, ndimage
 
+import matplotlib.pyplot as plt
+
 __all__ = ["SpectralChannel"]
 
 logger = logging.getLogger(__name__)
@@ -120,13 +122,13 @@ class SpectralChannel(object):
     upper_smoothing_sigma = 0.5
 
     def __init__(self, data, transitions, mask=None, redshift=False, continuum_order=-1,
-        outliers=False, wl_tolerance=0, wl_cont=1):
+        outliers=True, wl_tolerance=0.10, wl_cont=2):
 
         self.dispersion = data.dispersion
         self.data = data.flux
         self._finite = np.isfinite(self.data)
         self.variance = data.variance
-
+        self.ivariance = 1.0/self.variance
         self.transitions = transitions
 
         # Check that we have the fields we want. If not, add them.
@@ -141,7 +143,10 @@ class SpectralChannel(object):
         self.outliers = outliers
         self.wl_tolerance = wl_tolerance
         self.continuum_order = continuum_order
-        self.mask = mask
+        if mask is None:
+            self.mask = np.ones(len(self.dispersion))
+        else:
+            self.mask = mask
 
         # Create parameter list.
         self.parameters = []
@@ -173,9 +178,7 @@ class SpectralChannel(object):
                     sorted_wavelengths[nearby_index], sorted_wavelengths[nearby_index + 1], 
                     float(np.abs(np.diff(sorted_wavelengths[nearby_index:nearby_index+2]))), wl_cont))
 
-
-
-    def _fit(self, theta, full_output=False, verbose=True, fail_value=9e99):
+    def __call__(self, theta, full_output=False, verbose=True, fail_value=np.inf):
 
         theta_dict = dict(zip(self.parameters, theta))
         if self.outliers:
@@ -229,7 +232,6 @@ class SpectralChannel(object):
             finite = np.isfinite(ln_like) * np.isfinite(self.mask)
             ln_like = -np.sum(ln_like[finite])
 
-            print(ln_like)
             if verbose:
                 print(ln_like)
             
@@ -239,7 +241,6 @@ class SpectralChannel(object):
 
         # No outlier modelling; just return chi-sq.
         chi_sq = np.sum(chi_sq[np.isfinite(self.mask)])
-        print(chi_sq)
         if verbose:
             print(chi_sq)
         if full_output:
@@ -247,7 +248,8 @@ class SpectralChannel(object):
         return chi_sq
 
 
-    def optimise(self, max_iterations=3, initial_clip_iter=5, initial_clip_limits=(0.2, 3.0), verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
+    def optimise(self, max_iterations=3, initial_clip_iter=5, initial_clip_limits=(0.2, 3.0),
+        verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
         plot_clobber=False):
         # Optimise the channel and line parameters.
 
@@ -318,7 +320,6 @@ class SpectralChannel(object):
                 def fit_absorption_line(args, continuum, full_output, fail_value=np.inf):
                     
                     model = continuum.copy()
-
                     if self.wl_tolerance > 0:
                         depth, sigma, wavelength = args
 
@@ -355,17 +356,12 @@ class SpectralChannel(object):
                         return (chi_sq, model)
                     return chi_sq
 
-                if i == 0:
-                    index = self.dispersion.searchsorted(transition["rest_wavelength"])
-
-                    line_p0 = [1. - self.data[index]/continuum_shape[index], default_p0["sigma_{0}".format(j)]]
-                    if self.wl_tolerance > 0:
-                        line_p0.append(transition["rest_wavelength"])
-                else:
-                    line_p0 = np.array([default_p0["ld_{0}".format(j)], default_p0["sigma_{0}".format(j)], default_p0["wl_{0}".format(j)]])
-
                 index = self.dispersion.searchsorted(transition["rest_wavelength"])
-                line_p0 = np.array([1. - self.data[index]/continuum_shape[index], default_p0["smoothing_sigma"], transition["rest_wavelength"]])
+                line_p0 = np.array([
+                    1. - self.data[index]/continuum_shape[index],
+                    default_p0["smoothing_sigma"],
+                    transition["rest_wavelength"]
+                ])
 
                 xopt, fopt, niter, nfuncs, warnflag = op.fmin(fit_absorption_line, line_p0,
                     args=(continuum_shape, False), **op_line_kwargs)
@@ -389,45 +385,8 @@ class SpectralChannel(object):
             #       is a sufficient approximation. So here we are just checking for either redshift or
             #       continuum coefficients.
             channel_p0 = np.array([default_p0[parameter] for parameter in self.parameters])
-
-            if i == 0:
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots()
-                ax.plot(self.dispersion, self._fit(channel_p0, True, False)[1], 'r')
-                ax.plot(self.dispersion, self.data, 'k')
-                plt.savefig("moo.pdf")
-
             if self.continuum_order > -1 or "z" in self.parameters or force:
-                print("doing it")
-
-                bounds = []
-                for k, parameter in enumerate(self.parameters):
-                    if parameter.startswith("wl_"):
-                        index = int(parameter.split("_")[1])
-                        bounds.append([
-                            self.transitions[index]["rest_wavelength"] - self.wl_tolerance,
-                            self.transitions[index]["rest_wavelength"] + self.wl_tolerance
-                        ])
-
-                    elif parameter.startswith("sigma_"):
-                        bounds.append([0., self.upper_smoothing_sigma])
-
-                    elif parameter.startswith("ld_") or parameter == "Po":
-                        bounds.append([0., 1.])
-
-                    elif parameter == "Vo":
-                        bounds.append([0, None])
-
-                    elif parameter == "Yo":
-                        bounds.append([0, None])
-
-                    else:
-                        bounds.append((None, None))
-
-
-                #xopt, fopt, info = op.fmin_l_bfgs_b(self._fit, channel_p0,
-                #    args=(False, verbose), m=100, pgtol=1e-32, approx_grad=True, bounds=bounds)
-                xopt, fopt, iterations, funcalls, warnflag = op.fmin(self._fit, channel_p0,
+                xopt, fopt, iterations, funcalls, warnflag = op.fmin(self, channel_p0,
                     args=(False, verbose), **op_channel_kwargs)
                 
                 if warnflag > 0:
@@ -438,65 +397,22 @@ class SpectralChannel(object):
                     ]
                     logging.warn("{0} for channel fit. Optimised values may be (even more) inaccurate.".format(
                         message[warnflag]))
-
             else:
                 xopt = channel_p0
-
 
             # Update the default_p0 values with our optimised values for the next iteration.
             default_p0.update(dict(zip(self.parameters, xopt)))
 
-        """
-        fig, ax = plt.subplots()
-        ax.plot(self.dispersion, self.data,'k')
-        try:
-            ax.plot(self.dispersion, self._fit(channel_p0, True)[1], 'r')
-        except:
-            None
-        ax.plot(self.dispersion, self._fit(xopt, True)[1], 'b')
-        raise a
-        """
-
-        fopt, model = self._fit(xopt, True)
-        plot_filename = "moo2.pdf"
         if plot_filename is not None:
-
             # Produce a plot.
-            """
-            continuum = continuum_shape.copy()
-            for transition, result in zip(self.transitions, line_fits):
-                if self.wl_tolerance > 0:
-                    depth, sigma, wavelength = result["x"]
-                else:
-                    depth, sigma = result["x"]
-                    wavelength = transition["rest_wavelength"]
-
-                continuum *= self._absorption_line_(wavelength, depth, sigma)
-            """
+            fig, ax = plt.subplots(figsize=(18, 2))
+            fopt, model = self(xopt, True)
             ax.plot(self.dispersion, self.data, 'k')
             ax.plot(self.dispersion, model, 'b')
             ax.set_xlim(self.dispersion[0], self.dispersion[-1])
             fig.savefig(plot_filename, clobber=plot_clobber)
 
-        raise a
-        # Infer dat shit.
-        walkers = 200
-        ndim = len(self.parameters)
-        initial_pos = np.array([xopt + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
-        dat_inference = lambda x: -self._fit(x, False)
-        sampler = emcee.EnsembleSampler(walkers, ndim, dat_inference)
-
-        for i, (pos, lnprob, rstate) in enumerate(sampler.sample(initial_pos, iterations=400)):
-            print("mean acceptance: {0:.2f}, max ln prob: {1:.2f}".format(np.mean(sampler.acceptance_fraction),
-                np.max(sampler.lnprobability[:, i])))
-
-        raise a
-
-        # Calculate equivalent widths in the same units as the dispersion.
-        logging.warn("Assuming spectral dispersion units are Angstroms. Measured equivalent widths stored as mA.")
-        self.transitions["equivalent_width"] = np.array([xopt[self.parameters.index("ld_{0}".format(i))] \
-            for i in range(len(self.transitions))]) * xopt[0] * 1000. * 2.65 # TODO: Check integral.
-        return (xopt, fopt, model)
+        return dict(zip(self.parameters, xopt))
 
 
     def infer(self, p0, walkers, burn, sample, threads=1):
