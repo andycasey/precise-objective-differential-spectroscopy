@@ -6,6 +6,7 @@ __author__ = "Andy Casey <andy@astrowizici.st>"
 
 # Standard libraries
 import os
+from textwrap import dedent
 
 # Third party libraries
 import numpy as np
@@ -18,7 +19,7 @@ class CastelliKuruczAlphaParser(object):
     """
 
     ntau = 72
-    parameters = ["teff", "logg", "feh"]
+    parameters = ["Teff", "logg", "[M/H]"]
     atmosphere_parameters = ["RHOX", "T", "P", "XNE", "ABROSS", "ACCRAD", "VTURB",
         "FLXCNV", "VCONV", "VELSND"]
 

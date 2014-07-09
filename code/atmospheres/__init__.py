@@ -118,7 +118,7 @@ class Interpolator(object):
         return scipy.interpolate.griddata(subset_points, subset_values, interpolated_point.reshape(1, -1))[0]
 
 
-    def __call__(self, point, output_filename, clobber=False, **kwargs):
+    def __call__(self, point, output_filename, xi=0.0, clobber=False, **kwargs):
         """
         Interpolate a model atmosphere to the requested point, and write it to disk.
         """
@@ -127,7 +127,7 @@ class Interpolator(object):
             raise OSError("output filename exists and we won't clobber it.")
 
         photosphere = self._interpolate_photosphere(point)
-        return self.parse.write(point[:-1], point[-1], photosphere, output_filename,
+        return self.parse.write(point, xi, photosphere, output_filename,
             **kwargs)
         
 
