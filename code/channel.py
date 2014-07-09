@@ -178,6 +178,8 @@ class SpectralChannel(object):
                     sorted_wavelengths[nearby_index], sorted_wavelengths[nearby_index + 1], 
                     float(np.abs(np.diff(sorted_wavelengths[nearby_index:nearby_index+2]))), wl_cont))
 
+        self.optimised_parameters = {}
+
     def __call__(self, theta, full_output=False, verbose=True, fail_value=np.inf):
 
         theta_dict = dict(zip(self.parameters, theta))
@@ -249,7 +251,7 @@ class SpectralChannel(object):
 
 
     def optimise(self, max_iterations=3, initial_clip_iter=5, initial_clip_limits=(0.2, 3.0),
-        verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
+        force=False, verbose=False, line_kwargs=None, channel_kwargs=None, plot_filename=None,
         plot_clobber=False):
         # Optimise the channel and line parameters.
 
@@ -412,7 +414,9 @@ class SpectralChannel(object):
             ax.set_xlim(self.dispersion[0], self.dispersion[-1])
             fig.savefig(plot_filename, clobber=plot_clobber)
 
-        return dict(zip(self.parameters, xopt))
+        result = dict(zip(self.parameters, xopt))
+        setattr(self, "optimised_parameters", result)
+        return result
 
 
     def infer(self, p0, walkers, burn, sample, threads=1):

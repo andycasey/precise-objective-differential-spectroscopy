@@ -18,9 +18,9 @@ import numpy as np
 
 def unused_filename(dirname="", length=5):
 
-    filename = "".join(dirname, [choice(ascii_letters) for _ in xrange(length)])
+    filename = os.path.join(dirname, "".join([choice(ascii_letters) for _ in xrange(length)]))
     while os.path.exists(filename):
-        filename = "".join(dirname, [choice(ascii_letters) for _ in xrange(length)])
+        filename = os.path.join(dirname, "".join([choice(ascii_letters) for _ in xrange(length)]))
     return filename
 
 def sp_jacobian(stellar_parameters, *args):

@@ -124,17 +124,17 @@ def ln_likelihood(theta, interpolator, equivalent_widths_filename, moogsilent, f
 
 
 def generative_ln_prior(theta, parameters, star):
-    dtheta = dict(zip(parameters, theta))
 
-    # Outlier parameters within ranges.
-    if not (1 > dtheta.get("Po", 0.5) > 0) or 0 > dtheta.get("Vo", 1):
+    dtheta = dict(zip(parameters, theta))
+    if not (1 > dtheta.get("Po", 0.5) > 0) or 0 > dtheta.get("Vo", 1) or not (10 > dtheta.get("xi", 1) > 0) \
+    or any([(0 > dtheta.get("sigma_{0}".format(i), 1)) for i in range(len(star.channels))]):
         return -np.inf
 
     # [TODO] Any priors on the Star?
     return 0
 
 
-def generative_ln_likelihood(theta, parameters, star, moog_instance):
+def generative_ln_likelihood(theta, parameters, star, moog_instance, full_output=False):
     """
     Calculate the log-likelihood for the model star on a pixel-by-pixel basis.
     """
@@ -143,9 +143,9 @@ def generative_ln_likelihood(theta, parameters, star, moog_instance):
 
     # Interpolate a model atmosphere.
     stellar_parameters = [dtheta[p] for p in star.model_atmospheres.parameters]
-    atmosphere = utils.unused_filename(moog_instance.twd)
+    atmosphere_filename = utils.unused_filename(moog_instance.twd)
     try:
-        model_atmospheres.interpolate(stellar_parameters, atmosphere)
+        star.model_atmospheres(stellar_parameters, atmosphere_filename, dtheta.get("xi", 0))
     except:
         logging.debug("No atmosphere could be interpolated for {0}".format(stellar_parameters))
         return -np.inf
@@ -156,42 +156,52 @@ def generative_ln_likelihood(theta, parameters, star, moog_instance):
     for i, channel in enumerate(star.channels):
 
         # Perform the synthesis.
-        line_list = os.path.join(moogsilent.twd, "channel_{0}.list".format(i))
-        model_dispersion, fluxes = moog_instance.synth(atmosphere, line_list, True)
+        line_list = os.path.join(moog_instance.twd, "channel_{0}.list".format(i))
+        t_init = time()
+        try:
+            model_dispersion, fluxes = moog_instance.synth(atmosphere_filename, line_list,
+                parallel=True, wl_step=np.mean(np.diff(channel.dispersion)), wl_cont=channel.wl_cont)
+        
+        except moog.MOOGError as e:
+            logging.exception("Synthesis failed for point {0}".format(dtheta))
+            return -np.inf
+
+        logging.debug("Time taken: {0:.3f} seconds".format(time() - t_init))
         
         # Redshift syntheses where necessary.
         model_flux = fluxes[0]
         model_dispersion *= (1. + dtheta.get("z_{0}".format(i), 0))
 
+        # Smooth the synthetic spectrum.
+        sigma = dtheta.get("sigma_{0}".format(i), 0)
+        if sigma > 0:
+            kernel = (sigma/(2 * (2*np.log(2))**0.5))/np.mean(np.diff(channel.dispersion))
+            ndimage.gaussian_filter1d(model_flux, kernel, output=model_flux)
+
+        # Ensure the model_flux is on the same dispersion map as the data.
+        model_flux = np.interp(channel.dispersion, model_dispersion, model_flux,
+            left=np.nan, right=np.nan)
+
         # Transform the synthetic spectrum by the continuum where necessary.
         if channel.continuum_order > -1:
             coefficients = [dtheta["c_{0}_{1}".format(i, j)] \
             for j in range(channel.continuum_order + 1)]
-            continuum = np.polyval(coefficients, model_dispersion)
+            continuum = np.polyval(coefficients, channel.dispersion)
             model_flux *= continuum
         else:
             continuum = 1.0
 
-        # Smooth the synthetic spectrum.
-        kernel = dtheta.get("sigma_{0}".format(i), 0)
-        if kernel > 0:
-            ndimage.gaussian_filter1d(model_flux, kernel, output=model_flux)
-
         # [TODO] Do we have any telluric modelling to enter here?
-
-        # Ensure the model_flux is on the same dispersion map as the data.
-        model_flux = np.interpolate(channel.dispersion, model_dispersion, model_flux,
-            left=np.nan, right=np.nan)
-
+        
         # Calculate likelihoods.
-        star_likelihood = -0.5 * channel.mask * ((channel.data - model_flux)**2 \
-            * channel.ivariance)
+        star_likelihood = -0.5 * ((channel.data - model_flux)**2 \
+            * channel.ivariance - np.log(channel.ivariance))
         
         # Model outliers.
         Po = dtheta.get("Po", 0)
         if Po > 0:
             outlier_ivariance = 1.0/(channel.variance + dtheta["Vo"])
-            outlier_likelihood = -0.5 * channel.mask * ((channel.data - continuum)**2\
+            outlier_likelihood = -0.5 * ((channel.data - continuum)**2\
                 * outlier_ivariance - np.log(outlier_ivariance))
             likelihood[i] = np.nansum(np.logaddexp(
                 np.log(1-Po) + star_likelihood,
@@ -203,6 +213,8 @@ def generative_ln_likelihood(theta, parameters, star, moog_instance):
 
     # Remove intermediate files and return the likelihood.
     os.remove(atmosphere_filename)
+    if full_output:
+        return np.nansum(likelihood), model_flux
     return np.nansum(likelihood)
 
 
@@ -217,10 +229,12 @@ class Star(object):
     A model star.
     """
 
-    def __init__(self, model_atmosphere_wildmask, transitions, spectra=None, channels=None,
+    def __init__(self, model_atmosphere_wildmask, transitions=None, spectra=None, channels=None,
         **kwargs):
         """
         Create a model star.
+
+        EITHER PROVIDE TRANSITIONS AND SPECTRA, OR CHANNELS
 
         model_atmosphere_wildmask : wildmask to match model atmosphere files
         transitions : a record array of transitions and relevant synthesis line lists
@@ -229,6 +243,7 @@ class Star(object):
 
         self.transitions = transitions
         if spectra is not None and len(spectra) > 0:
+            assert transitions is not None, "Transitions must be given if spectra are provided."
             assert channels is None, "Channels keyword must be None if spectra are provided."
 
             # Sort the spectra from blue to red
@@ -258,7 +273,7 @@ class Star(object):
         return None
 
 
-    def infer_absolute(self, p0, walkers=200, burn=400, sample=100, threads=4,
+    def infer(self, p0, walkers=-1, burn=400, sample=100, threads=8,
         model_outliers=True):
         """
         Infer the (absolute) stellar parameters and abundances for the star by
@@ -266,45 +281,82 @@ class Star(object):
         """
 
         # Create our parameter list.
-        parameters = [] + self.model_atmospheres.parameters
+        default_p0 = {}
+        parameters = [] + self.model_atmospheres.parameters + ["xi"] # Hacky.
 
         # Abundances of elements.
-        parameters.extend(["[{0}/H]".format(utils.element_to_species(species)) \
-            for species in set(map(int, self.transitions["species"]))])
+        all_species = set(sum(map(list, [channel.transitions["species"].astype(int) \
+            for channel in self.channels]), []))
+        elemental_abundances = ["[{0}/H]".format(utils.species_to_element(each).split()[0]) \
+            for each in all_species]
+        parameters.extend(elemental_abundances)
+        default_p0.update(dict(zip(elemental_abundances, [0] * len(elemental_abundances))))
 
         for i, channel in enumerate(self.channels):
+
+            # Smoothing.
+            parameters.append("sigma_{0}".format(i))
+            default_p0["sigma_{0}".format(i)] = 0.05
+
             # Redshift in this channel?
             if channel.redshift:
                 parameters.append("z_{0}".format(i))
+                default_p0["z_{0}".format(i)] = channel.optimised_parameters.get("z", 0)
 
             # Continuum coefficients.
-            parameters.extend(["c_{0}_{1}".format(i, j) \
-                for j in range(channel.continuum_order + 1)])
+            continuum_parameters = ["c_{0}_{1}".format(i, j) \
+                for j in range(channel.continuum_order + 1)]
+            parameters.extend(continuum_parameters)
+            default_p0.update(dict(zip(continuum_parameters,
+                [channel.optimised_parameters.get("c_{0}".format(j), 1.) \
+                for j in range(channel.continuum_order + 1)])))
 
         # Outliers will be modelled as a Gaussian mixture model with a distribution 
         # mean equivalent to the continuum.
         if model_outliers:
             parameters.extend(["Po", "Vo"])
+            default_p0.update({"Po": 0.10, "Vo": np.max([np.nanvar(channel.data) \
+                for channel in self.channels])})
+
+        # Testing purposes only:
+        parameters.remove("[Fe/H]")
 
         ndim = len(parameters)
-        initial_pos = np.array([p0 + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
+        default_p0.update(p0)
+        if walkers == -1:
+            walkers = 2*ndim
+
+        p0_actual = np.array([default_p0.get(parameter) for parameter in parameters])
+        #if channel.continuum_order >= 0:
+        #    guess_coefficients = list(np.abs(np.polyfit(channel.dispersion, channel.data, channel.continuum_order) - np.array([channel.optimised_parameters.get("c_{0}".format(j)) \
+        #        for j in range(channel.continuum_order + 1)])))
+        #else: guess_coefficients = []
+
+        initial_pos = emcee.utils.sample_ball(p0_actual,
+            np.array([0.01, 0.01, 0.01, 0.01,0.01, 0.01, 0.01]),
+            walkers)
+        #initial_pos = np.array([p0_actual + 1e-4 * np.random.randn(ndim) for i in range(walkers)])
         threads = threads if threads > 0 else cpu_count()
 
         # Create a MOOG instance.
-        with moog.instance() as moogsilent:
+        with moog.instance("/tmp/", debug=True) as moogsilent:
 
             # Write the channel synthesis line lists to file.
+            for i, channel in enumerate(self.channels):
+                line_list_filename = os.path.join(moogsilent.twd, "channel_{0}.list".format(i))
+                with open(line_list_filename, "w+") as fp:
+                    fp.write(moogsilent._format_ew_input(channel.transitions, equivalent_widths=False))
 
-
+            # Create the sampler.
             sampler = emcee.EnsembleSampler(walkers, ndim, generative_ln_probability,
-                args=(parameters, star, moogsilent), threads=threads)
+                args=(parameters, self, moogsilent), threads=threads)
 
             mean_acceptance_fractions = np.zeros(burn + sample)
             for i, (pos, lnprob, rstate) in enumerate(sampler.sample(initial_pos, iterations=burn)):
                 mean_acceptance_fractions[i] = np.mean(sampler.acceptance_fraction)
-                logger.info(u"Sampler has finished step {0:.0f} with <a_f> = {1:.3f},"\
+                logger.info(u"Sampler has finished burn step {0:.0f} with <a_f> = {1:.3f},"\
                     " maximum log probability in last step was {2:.3e}".format(i + 1,
-                        mean_acceptance_fractions[i], np.max(sampler.lnprobability[:, i])))
+                    mean_acceptance_fractions[i], np.max(sampler.lnprobability[:, i])))
 
                 if mean_acceptance_fractions[i] in (0, 1):
                     raise RuntimeError("the acceptance fraction has gone crazy!")
@@ -317,6 +369,9 @@ class Star(object):
             logger.info("Sampling posterior...")
             for j, state in enumerate(sampler.sample(pos, iterations=sample)):
                 mean_acceptance_fractions[i + j + 1] = np.mean(sampler.acceptance_fraction)
+                logger.info(u"Sampler has finished sample step {0:.0f} with <a_f> = {1:.3f},"\
+                    " maximum log probability in last step was {2:.3e}".format(j + 1,
+                        mean_acceptance_fractions[i+j+1], np.max(sampler.lnprobability[:, j])))
 
         # Concatenate the existing chain and lnprobability with the posterior samples.
         chain = np.concatenate([chain, sampler.chain], axis=1)
@@ -328,7 +383,7 @@ class Star(object):
 
         # Get the quantiles.
         posteriors = {}
-        for parameter_name, (ml_value, quantile_16, quantile_84) in zip(self.parameters, 
+        for parameter_name, (ml_value, quantile_16, quantile_84) in zip(parameters, 
             map(lambda v: (v[1], v[2]-v[1], v[1]-v[0]),
                 zip(*np.percentile(sampler.chain.reshape(-1, ndim), [16, 50, 84], axis=0)))):
             posteriors[parameter_name] = (ml_value, quantile_16, quantile_84)
@@ -339,14 +394,14 @@ class Star(object):
             "lnprobability": lnprobability,
             "acceptance_fractions": mean_acceptance_fractions,
         }
-
+        raise a
         return posteriors, sampler, info
 
 
 
 
 
-    def optimise(self, p0=None):
+    def optimise_stellar_parameters(self, p0=None):
         """
         Perform an excitation and ionisation balance from an initial guess point.
         """
@@ -362,7 +417,7 @@ class Star(object):
         ])
         
         # Initiate a MOOG instance.
-        with moog.instance("/tmp",debug=True) as moogsilent:
+        with moog.instance("/tmp", debug=True) as moogsilent:
 
             # Write equivalent widths to file as these won't change during optimisation.
             with open("ews", "w+") as fp:

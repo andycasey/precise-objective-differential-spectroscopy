@@ -11,6 +11,7 @@ class spectrum(object):
 
 import sick
 spec = sick.specutils.Spectrum.load("spectra/hermes-sun.fits")
+spec = sick.specutils.Spectrum.load("spectra/uvessun1.txt")
 
 
 blue_channel = spectrum()
@@ -20,6 +21,10 @@ blue_channel.variance =  spec.variance
 
 
 with open("transitions.pkl", "rb") as fp:
+    transitions = pickle.load(fp)
+
+
+with open("sousa-transitions.pkl", "rb") as fp:
     transitions = pickle.load(fp)
 
 
@@ -64,9 +69,14 @@ for row in use_regions:
 
 print(np.sum(np.isfinite(mask)))
 
-blue = SpectralChannel(blue_channel, transitions[transition_indices], mask=mask, redshift=False, continuum_order=3,
+blue = SpectralChannel(blue_channel, transitions[transition_indices], mask=mask, redshift=False, continuum_order=-1,
     wl_tolerance=0.10, wl_cont=2, outliers=True)
 
+xopt = blue.optimise(plot_filename="blue_optimise.pdf", plot_clobber=True)
+
+
+star = Star("/Users/arc/atmospheres/castelli-kurucz-2004/a???at*.dat", channels=[blue])
+star.infer({"Teff": 5700., "logg": 4.0, "[M/H]": 0.1, "xi": 0.9}, walkers=200, burn=450, sample=50)
 
 
 

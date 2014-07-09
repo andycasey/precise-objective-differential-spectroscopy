@@ -75,7 +75,7 @@ class instance(object):
         if filename is None:
             filename = os.path.join(self.twd, "batch.par")
 
-        logger.info("Executing input file: {0}".format(filename))
+        logger.debug("Executing input file: {0}".format(filename))
 
         class Alarm(Exception):
             pass
@@ -132,7 +132,8 @@ class instance(object):
         return filename
 
 
-    def _format_ew_input(self, measurements, comment=None, force_loggf=True):
+    def _format_ew_input(self, measurements, comment=None, equivalent_widths=True,
+        force_loggf=True):
         """
         measurments should be recarray
         """
@@ -140,7 +141,10 @@ class instance(object):
         output = comment.rstrip() if comment is not None else ""
         output += "\n"
 
-        line = "{0:10.3f} {1:9.3f} {2:8.3f} {3:6.3f}                           {4:7.3f}\n"
+
+        line = "{0:10.3f} {1:9.3f} {2:8.3f} {3:6.3f}"
+        if equivalent_widths: line += "                           {4:7.3f}"
+        line += "\n"
 
         # Sort all the lines first transition, then by wavelength
         wavelength_key = ["wavelength", "rest_wavelength"]["rest_wavelength" in measurements.dtype.names]
@@ -153,8 +157,10 @@ class instance(object):
 
         for i, measurement in enumerate(measurements):
             # TODO: Ignoring van Der Waal damping coefficients for the moment << implement if they exist!
-            output += line.format(*[measurement[col] for col in [wavelength_key, "species",
-                "excitation_potential", "loggf", "equivalent_width"]])
+            columns = [wavelength_key, "species", "excitation_potential", "loggf"]
+            if equivalent_widths:
+                columns.append("equivalent_width")
+            output += line.format(*[measurement[col] for col in columns])
 
         if force_loggf and np.all(measurements["loggf"] > 0):
             warnings.warn("The atomic line list contains no lines with positive oscillator "
@@ -344,7 +350,8 @@ class instance(object):
         return (dispersion, fluxes)
 
 
-    def synth(self, atmosphere_filename, line_list_filename, parallel=False, **kwargs):
+    def synth(self, atmosphere_filename, line_list_filename, parallel=False, debug=True,
+        **kwargs):
 
         # Prepare a synth file
         line_list_filename = self._cp_to_twd(line_list_filename)
@@ -356,12 +363,9 @@ class instance(object):
                 for filename in ("batch.par", "abfind.std", "abfind.sum")]
         
         else:
-            input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
-            while os.path.exists(input_filename):
-                input_filename = os.path.join(self.twd, "".join([choice(ascii_letters) for _ in xrange(5)]) + ".in")
-
-            standard_out = input_filename[:-3] + ".out"
-            summary_out = os.path.join(self.twd, "abfind.sum")
+            input_filename = utils.unused_filename(self.twd)
+            standard_out = input_filename + ".std"
+            summary_out = input_filename + ".sum"
 
         # Write the synth file
         with open(input_filename, "w") as fp:
@@ -375,7 +379,7 @@ class instance(object):
         spectrum = self._parse_synth_standard_output(standard_out, num_spectra)
 
         # Remove in/out files
-        map(os.remove, [input_filename, standard_out, summary_out])
+        #map(os.remove, [input_filename, standard_out, summary_out])
 
         return spectrum
 
